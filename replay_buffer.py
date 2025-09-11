@@ -1,0 +1,24 @@
+# replay_buffer.py
+# 轻量 near-miss 样本库（为分布采样与统计服务）
+
+import random
+
+class NearMissReplay:
+    def __init__(self, capacity=50000):
+        self.capacity = int(capacity)
+        self.data = []  # list of dict: {"ds","dd","dyaw","F"}
+
+    def __len__(self):
+        return len(self.data)
+
+    def add_many(self, items):
+        for it in items:
+            self.data.append(dict(it))
+            if len(self.data) > self.capacity:
+                self.data.pop(0)
+
+    def sample(self, k):
+        k = min(int(k), len(self.data))
+        if k <= 0:
+            return []
+        return random.sample(self.data, k)
