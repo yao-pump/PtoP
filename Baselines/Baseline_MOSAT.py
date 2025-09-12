@@ -1,73 +1,168 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MOSAT 主程序（完整可运行骨架）：
-- 个体=场景；染色体=单车行为序列；基因=原子机动 或 模体机动
-- 多目标：min METTC；max DFP、VOA、AEDF（对齐 MOSAT）
-- NSGA-II：帕累托分级 + 拥挤度距离；交叉/变异；停滞重启
-- 连续仿真执行：多个候选场景按队列交替注入，无需重置模拟器/重连 ADS
-- 与已有 CARLA 辅助模块直接对接（MultiVehicleDemo, action_trans 等）
-
-参考：MOSAT: Finding Safety Violations of ADS using Multi-objective Genetic Algorithm（ESEC/FSE'22）
+主程序（完整可运行骨架）：
+- GA 采样 + 代末 SVGD 微调（对 NPC 初始 (ds, dd, dyaw)）
+- 【已替换】MOSAT（模体驱动）在线操控 NPC（原子机动序列）
+- MLP surrogate：输入 = 起点特征，标签 = episode 内 NPC 与 EGO 最近距离时刻的 hazard（min-distance 方案）
+- 在线每回合 1-2 epoch 微调；可选 EMA（若 surrogate 提供 ema_update）
 """
 
 import os
+import cv2
 import math
 import time
-import random
 import shutil
-import json
-from collections import deque, defaultdict
-from dataclasses import dataclass, field
-from typing import List, Dict, Tuple, Optional
-
+import random
 import numpy as np
+from queue import Queue
+import json
+from datetime import datetime
+
 import torch
 import carla
 
-# ====== 复用你工程里已有的工具 ====== #
 from utility import (
-    has_passed_destination, action_trans, apollo_clear_prediction_planning,
-    purge_npcs
+    has_passed_destination, action_trans, apollo_clear_prediction_planning, purge_npcs, calculate_population_distance, parents_selection, next_gen_selection
 )
 from world import MultiVehicleDemo
+from offline_searcher import CombinedGA
+from npc_surrogate_mlp import NPCHazardMLPSurrogate
+from npc_svgd_runtime import RuntimeNPCSVGD
+from replay_buffer import NearMissReplay
 
 # ====================== 全局超参数 ======================
 TIME_STEP = 0.05
+population_size = 10  # 每代 10 个有效回合
 
-# —— 连续仿真/早退 —— #
-EPISODE_MAX_SECONDS = 120.0
-NO_PROGRESS_SECONDS = 12
+# —— Traffic Manager —— #
+KEEP_ALIVE_PERIOD = 30  # TM 续权周期（tick）
+
+# —— 录像 —— #
+RECORDING = False
+
+# —— 早退/兜底 —— #
+EPISODE_MAX_SECONDS = 180.0
+NO_PROGRESS_SECONDS = 15
 PROGRESS_THRESH = 2.0
-STARTUP_STEPS = 300
+STARTUP_STEPS = 500
 
-# —— 种群规模/演化 —— #
-POP_SIZE = 10
-MAX_GENERATIONS = 20
-P_CROSS = 0.4     # 交叉概率（个体层面）
-P_MUT = 0.3       # 变异概率（安全违规场景内：双点交叉或洗牌）
-STAGNATION_RESTART = 3  # 连续3代停滞则重启
+# —— SVGD 门控（代际末触发，不在回合内） —— #
+NEARMISS_SAVE_TAU = 0.5
+SVGD_TOP_CASES = 5
+SVGD_STEPS_PER_CASE = 8
+SVGD_EPS = 0.08         # 步长更小
+SVGD_BETA = 3           # 排斥更强
+SVGD_GRAD_EPS = 0.35    # 核更窄
 
-# —— 染色体长度/车辆数限制 —— #
-GENES_PER_CHROM_MIN = 4
-GENES_PER_CHROM_MAX = 10
-NPC_PER_SCEN_MIN = 4
-NPC_PER_SCEN_MAX = 18
-INIT_DIST_MAX = 50.0  # NPC 初始相对 EGO 距离上限（米）
+# —— SVGD 搜索盒 —— #
+DS_LIM = 25.0
+DD_LIM = 4.5
+DYAW_LIM = 20.0
+MIN_SEP = 3.5
 
-# —— 模体时间片（与 MOSAT 设定一致/近似） —— #
-ATOMIC_DT = 1.0
-MOTIF_DT = 4.0
+# —— 生成数量最低门槛（实际生成太少直接回滚） —— #
+MIN_NPC = 20
 
-# —— DFP/VOA 采样步长 —— #
-DFP_SAMPLE_DT = 0.1
-VOA_SAMPLE_DT = 1.0
+# ====================== MOSAT 原子/模体定义（新增） ======================
+ATOMIC_ACTIONS = [
+    "accelerate", "break",
+    "left_change_acc", "left_change_dec",
+    "right_change_acc", "right_change_dec",
+]
 
-# —— 记录 & 回放存档 —— #
-RECORD_JSONL = "mosat_violations.jsonl"
-ARCHIVE_DIR = "mosat_replays"  # 留给你将来落地回放
+class AtomicGene:
+    """一个原子机动 + 持续时间（秒）"""
+    def __init__(self, act: str, dur: float = 1.0):
+        assert act in ATOMIC_ACTIONS
+        self.act = act
+        self.dur = float(dur)
+
+class MotifGene:
+    """
+    模体类型：ahead / side_front / behind / side_behind
+    基于 EGO 与 NPC 的相对构型生成一段原子机动序列
+    """
+    def __init__(self, motif_type: str, dur: float = 4.0):
+        assert motif_type in ["ahead", "side_front", "behind", "side_behind"]
+        self.motif_type = motif_type
+        self.dur = float(dur)
+
+    def plan(self, world_map, ego: carla.Actor, npc: carla.Actor):
+        """产出若干 AtomicGene 构成的序列"""
+        ego_wp = world_map.get_waypoint(ego.get_location(), project_to_road=True)
+        npc_wp = world_map.get_waypoint(npc.get_location(), project_to_road=True)
+        same_lane = (ego_wp.road_id == npc_wp.road_id and ego_wp.lane_id == npc_wp.lane_id)
+
+        ex, ey = ego.get_location().x, ego.get_location().y
+        nx, ny = npc.get_location().x, npc.get_location().y
+        dx, dy = nx - ex, ny - ey
+        cy, sy = _yaw_to_unit(ego.get_transform().rotation.yaw)
+        front = (dx*cy + dy*sy) > 0  # NPC 是否在 EGO 前方
+
+        # 每个模体给出 1~3 个原子机动，持续时间粗定为 1s/步
+        if self.motif_type == "ahead" and same_lane and front:
+            return [AtomicGene(random.choice(["left_change_dec","right_change_dec","break"]))]
+
+        if self.motif_type == "side_front" and (not same_lane) and front:
+            return [
+                AtomicGene(random.choice(["left_change_dec","right_change_dec"])),
+                AtomicGene(random.choice(["break","left_change_dec","right_change_dec"]))
+            ]
+
+        if self.motif_type == "behind" and same_lane and (not front):
+            return [AtomicGene(random.choice(["left_change_acc","right_change_acc"])),
+                    AtomicGene("accelerate")]
+
+        if self.motif_type == "side_behind" and (not same_lane) and (not front):
+            return [AtomicGene("accelerate"),
+                    AtomicGene(random.choice(["left_change_acc","right_change_acc"]))]
+
+        # 默认回退：轻微加/减速
+        return [AtomicGene(random.choice(["accelerate","break"]))]
+
+def _pick_motif_for_npc(world_map, ego: carla.Actor, npc: carla.Actor) -> MotifGene:
+    """
+    基于相对构型选择一个模体类型
+    """
+    ego_wp = world_map.get_waypoint(ego.get_location(), project_to_road=True)
+    npc_wp = world_map.get_waypoint(npc.get_location(), project_to_road=True)
+    same_lane = (ego_wp.road_id == npc_wp.road_id and ego_wp.lane_id == npc_wp.lane_id)
+
+    ex, ey = ego.get_location().x, ego.get_location().y
+    nx, ny = npc.get_location().x, npc.get_location().y
+    dx, dy = nx - ex, ny - ey
+    cy, sy = _yaw_to_unit(ego.get_transform().rotation.yaw)
+    front = (dx*cy + dy*sy) > 0
+
+    if same_lane and front:        kind = "ahead"
+    elif (not same_lane) and front: kind = "side_front"
+    elif same_lane and (not front): kind = "behind"
+    else:                           kind = "side_behind"
+    return MotifGene(kind, dur=4.0)
+
+def mosat_plan_sequences(world_map, ego: carla.Actor, vehicles: list):
+    """
+    为每个 NPC 生成一段序列：模体 -> 原子机动序列
+    返回: dict[vid] = [{"act": str, "steps": int}, ...]
+    """
+    seqs = {}
+    for v in vehicles:
+        if v.id == ego.id:
+            continue
+        motif = _pick_motif_for_npc(world_map, ego, v)
+        atomic_seq = motif.plan(world_map, ego, v)
+        # 将持续时间换算成“仿真步数”
+        seqs[v.id] = [{"act": a.act, "steps": max(1, int(a.dur / TIME_STEP))} for a in atomic_seq]
+    return seqs
 
 # ====================== 几何/辅助 ======================
+def average_population_distance(population, generation):
+    """
+    计算一个 population 与整个 generation 之间的平均距离
+    """
+    distances = [calculate_population_distance(population["position_info"], pop["position_info"]) for pop in generation]
+    return np.mean(distances)
 def _yaw_to_unit(yaw_deg: float):
     r = math.radians(yaw_deg)
     return math.cos(r), math.sin(r)
@@ -80,233 +175,7 @@ def ego_local_sd(ego_tf: carla.Transform, pt: carla.Location):
     d = -dx * sy + dy * cy
     return s, d
 
-# ====================== 原子机动定义 ======================
-# 统一用 action_trans(ctrl, act_name) 执行，名称沿用你项目中的 ACT 集
-ATOMIC_ACTIONS = [
-    "accelerate", "break", "left_change_acc", "left_change_dec",
-    "right_change_acc", "right_change_dec"
-]
-
-@dataclass
-class AtomicGene:
-    """一个原子机动 + 持续时间（秒）"""
-    act: str
-    dur: float = ATOMIC_DT
-
-# ====================== 模体（Motif）定义（FSM 风格） ======================
-# 4 种模体：ahead / side_front / behind / side_behind
-# 根据 NPC 与 EGO 的相对构型（同/异车道、前后左右）生成一段动作序列
-
-class MotifGene:
-    def __init__(self, motif_type: str):
-        assert motif_type in ["ahead", "side_front", "behind", "side_behind"]
-        self.motif_type = motif_type
-        self.dur = MOTIF_DT
-
-    def plan(self, world_map, ego: carla.Actor, npc: carla.Actor) -> List[AtomicGene]:
-        # 轻量近似：通过相对位置与车道判断，产出 1~3 个原子动作序列
-        ego_wp = world_map.get_waypoint(ego.get_location())
-        npc_wp = world_map.get_waypoint(npc.get_location())
-        same_lane = (ego_wp.road_id == npc_wp.road_id and ego_wp.lane_id == npc_wp.lane_id)
-        ex, ey = ego.get_location().x, ego.get_location().y
-        nx, ny = npc.get_location().x, npc.get_location().y
-        dx, dy = nx - ex, ny - ey
-        cy, sy = _yaw_to_unit(ego.get_transform().rotation.yaw)
-        front = (dx*cy + dy*sy) > 0  # 在 EGO 前方？
-
-        if self.motif_type == "ahead" and same_lane and front:
-            # 三择一：减速/制动/左右变道并回位（近似为一次变道）
-            choice = random.choice([
-                [AtomicGene("left_change_dec")],
-                [AtomicGene("right_change_dec")],
-                [AtomicGene("break")]
-            ])
-            return choice
-
-        if self.motif_type == "side_front" and (not same_lane) and front:
-            # 先并入 EGO 车道，再：减速或制动或再换道
-            first = [AtomicGene(random.choice(["left_change_dec","right_change_dec"]))]
-            second = [AtomicGene(random.choice(["break","left_change_dec","right_change_dec"]))]
-            return first + second
-
-        if self.motif_type == "behind" and same_lane and (not front):
-            # 加速逼近 -> 邻道超越（加速）
-            return [AtomicGene(random.choice(["left_change_acc","right_change_acc"])),
-                    AtomicGene("accelerate")]
-
-        if self.motif_type == "side_behind" and (not same_lane) and (not front):
-            # 加速切到 EGO 前侧
-            return [AtomicGene("accelerate"),
-                    AtomicGene(random.choice(["left_change_acc","right_change_acc"]))]
-
-        # 默认回退：轻微加减速
-        return [AtomicGene(random.choice(["accelerate","break"]))]
-
-# ====================== 染色体/个体表示 ======================
-@dataclass
-class Gene:
-    kind: str  # "atomic" | "motif"
-    payload: object  # AtomicGene 或 MotifGene
-
-@dataclass
-class Chromosome:
-    """一辆 NPC 的机动序列"""
-    genes: List[Gene] = field(default_factory=list)
-
-@dataclass
-class ScenarioIndividual:
-    """一个场景 = 若干 NPC 的染色体 + 初始相对位姿"""
-    chroms: List[Chromosome] = field(default_factory=list)
-    # 初始相对位置（相对 EGO 起点）：[(ds, dd, dyaw), ...]，与 chroms 对齐
-    init_rel: List[Tuple[float,float,float]] = field(default_factory=list)
-    # 适应度（多目标）：(METTC, -DFP, -VOA, -AEDF)  —— 注意排序方向
-    fitness: Optional[Tuple[float,float,float,float]] = None
-    # 标记是否发生安全违规（碰撞/红灯等），用于变异策略
-    violated: bool = False
-
-# ====================== 随机初始化 ======================
-def random_atomic_gene() -> Gene:
-    return Gene("atomic", AtomicGene(act=random.choice(ATOMIC_ACTIONS)))
-
-def random_motif_gene() -> Gene:
-    return Gene("motif", MotifGene(random.choice(["ahead","side_front","behind","side_behind"])))
-
-def random_chromosome() -> Chromosome:
-    L = random.randint(GENES_PER_CHROM_MIN, GENES_PER_CHROM_MAX)
-    genes = []
-    for _ in range(L):
-        if random.random() < 0.5:
-            genes.append(random_atomic_gene())
-        else:
-            genes.append(random_motif_gene())
-    return Chromosome(genes)
-
-def random_individual(npcs: int) -> ScenarioIndividual:
-    chroms = [random_chromosome() for _ in range(npcs)]
-    init_rel = []
-    for _ in range(npcs):
-        ds = random.uniform(5.0, INIT_DIST_MAX) * (1 if random.random()<0.6 else -1)  # 前后
-        dd = random.uniform(-4.0, 4.0)  # 左右
-        dyaw = random.uniform(-15.0, 15.0)
-        init_rel.append((ds, dd, dyaw))
-    return ScenarioIndividual(chroms=chroms, init_rel=init_rel)
-
-# ====================== NSGA-II：帕累托分级 + 拥挤度 ======================
-def dominates(a, b):
-    """a 是否支配 b（全部不劣，且至少一项严格更好）—— 目标向量： (METTC, -DFP, -VOA, -AEDF)"""
-    better_or_equal = all(x <= y for x, y in zip(a, b))
-    strictly_better = any(x < y for x, y in zip(a, b))
-    return better_or_equal and strictly_better
-
-def fast_non_dominated_sort(pop):
-    S = defaultdict(list)
-    n = defaultdict(int)
-    fronts = [[]]
-    for p in pop:
-        S[p] = []
-        n[p] = 0
-        for q in pop:
-            if p is q: continue
-            if dominates(p.fitness, q.fitness):
-                S[p].append(q)
-            elif dominates(q.fitness, p.fitness):
-                n[p] += 1
-        if n[p] == 0:
-            fronts[0].append(p)
-    i = 0
-    while fronts[i]:
-        Q = []
-        for p in fronts[i]:
-            for q in S[p]:
-                n[q] -= 1
-                if n[q] == 0:
-                    Q.append(q)
-        i += 1
-        fronts.append(Q)
-    if not fronts[-1]:
-        fronts.pop()
-    return fronts
-
-def crowding_distance(front):
-    m = len(front[0].fitness)
-    N = len(front)
-    dist = {ind: 0.0 for ind in front}
-    for k in range(m):
-        front.sort(key=lambda ind: ind.fitness[k])
-        dist[front[0]] = dist[front[-1]] = float('inf')
-        fmin = front[0].fitness[k]
-        fmax = front[-1].fitness[k]
-        if fmax == fmin:
-            continue
-        for i in range(1, N-1):
-            prev = front[i-1].fitness[k]
-            nxt = front[i+1].fitness[k]
-            dist[front[i]] += (nxt - prev) / (fmax - fmin)
-    return dist
-
-def nsga2_select(pop, k):
-    fronts = fast_non_dominated_sort(pop)
-    new_pop = []
-    for F in fronts:
-        if len(new_pop) + len(F) <= k:
-            new_pop.extend(F)
-        else:
-            d = crowding_distance(F)
-            F.sort(key=lambda ind: d[ind], reverse=True)
-            new_pop.extend(F[:(k - len(new_pop))])
-            break
-    return new_pop
-
-# ====================== 交叉/变异 ======================
-def uniform_crossover(p1: ScenarioIndividual, p2: ScenarioIndividual):
-    c1 = ScenarioIndividual()
-    c2 = ScenarioIndividual()
-    for (ch1, ch2) in zip(p1.chroms, p2.chroms):
-        if random.random() < 0.5:
-            c1.chroms.append(ch1); c2.chroms.append(ch2)
-        else:
-            c1.chroms.append(ch2); c2.chroms.append(ch1)
-    # 初始相对位姿也统一交叉
-    for (r1, r2) in zip(p1.init_rel, p2.init_rel):
-        if random.random() < 0.5:
-            c1.init_rel.append(r1); c2.init_rel.append(r2)
-        else:
-            c1.init_rel.append(r2); c2.init_rel.append(r1)
-    return c1, c2
-
-def gene_mutation_min_ettc(ind: ScenarioIndividual, target_ch_idx: int, gene_idx: int):
-    """对最小 ETTC 的基因做‘替换/参数扰动’"""
-    chrom = ind.chroms[target_ch_idx]
-    g = chrom.genes[gene_idx]
-    if g.kind == "atomic":
-        # 原子基因：动作替换 或 时长微调
-        if random.random() < 0.5:
-            g.payload.act = random.choice(ATOMIC_ACTIONS)
-        else:
-            g.payload.dur = max(0.5, min(3.0, g.payload.dur + random.uniform(-0.3, 0.3)))
-    else:
-        # 模体基因：换另一个模体 或 退化成一个原子动作
-        if random.random() < 0.5:
-            g.payload = MotifGene(random.choice(["ahead","side_front","behind","side_behind"]))
-        else:
-            chrom.genes[gene_idx] = random_atomic_gene()
-
-def two_point_crossover_inside(ind: ScenarioIndividual):
-    """在同一场景内随机挑两条染色体，做双点交换"""
-    if len(ind.chroms) < 2: return
-    i, j = random.sample(range(len(ind.chroms)), 2)
-    c1, c2 = ind.chroms[i], ind.chroms[j]
-    if len(c1.genes) < 3 or len(c2.genes) < 3: return
-    p1 = random.randint(1, len(c1.genes)-2)
-    p2 = random.randint(1, len(c2.genes)-2)
-    c1.genes[p1:], c2.genes[p2:] = c2.genes[p2:], c1.genes[p1:]
-
-def shuffle_inside(ind: ScenarioIndividual):
-    """逐条染色体随机洗牌基因顺序"""
-    for c in ind.chroms:
-        random.shuffle(c.genes)
-
-# ====================== 记录器（采集帧数据用于指标计算） ======================
+# ====================== Episode 记录 ======================
 class EpisodeRecorder:
     def __init__(self, world_map):
         self.map = world_map
@@ -322,372 +191,171 @@ class EpisodeRecorder:
         ego_vel = self._vel_of(ego)
         npcs = {}
         for v in vehicles:
-            if v.id == ego.id: continue
+            if v.id == ego.id:
+                continue
             npcs[v.id] = {"tf": v.get_transform(), "vel": self._vel_of(v)}
         self.frames.append({"ego": {"tf": ego_tf, "vel": ego_vel}, "npcs": npcs})
 
-# ====================== 多目标指标 ======================
-def _speed_of(vel): return math.sqrt(vel[0]**2 + vel[1]**2 + vel[2]**2)
+# ====================== min-distance hazard 标签 ======================
 
-def compute_METTC(frames) -> float:
-    """最小 ETTC（近似实现：逐帧估计，取最小）"""
-    if not frames: return float('inf')
-    min_ettc = float('inf')
-    for f in frames:
-        ego_tf = f["ego"]["tf"]; ego_vel = f["ego"]["vel"]
-        v_ego = _speed_of(ego_vel)
-        cy, sy = _yaw_to_unit(ego_tf.rotation.yaw)
-        for npc_id, nk in f["npcs"].items():
-            # 估算两直线轨迹交点到 EGO 的时间
-            ex, ey = ego_tf.location.x, ego_tf.location.y
-            nx, ny = nk["tf"].location.x, nk["tf"].location.y
-            # 简化：若方向接近且前向距离缩小，则估一个相遇时间
-            dx, dy = nx - ex, ny - ey
-            dist = math.hypot(dx, dy) + 1e-6
-            if v_ego < 0.2: continue
-            ettc = dist / v_ego
-            min_ettc = min(min_ettc, ettc)
-    return max(0.0, min_ettc)
+def _closing_speed_at(ego_tf, ego_vel, npc_tf, npc_vel):
+    rx = npc_tf.location.x - ego_tf.location.x
+    ry = npc_tf.location.y - ego_tf.location.y
+    rnorm = math.hypot(rx, ry) + 1e-6
+    ux, uy = rx / rnorm, ry / rnorm
+    vrelx = npc_vel[0] - ego_vel[0]
+    vrely = npc_vel[1] - ego_vel[1]
+    v_close = -(vrelx * ux + vrely * uy)  # 正值=在靠近
+    return max(0.0, v_close)
 
-def compute_DFP(frames, world_map) -> float:
-    """最大路线偏离：planned 路径近似为按车道中心线匀速前进"""
-    if not frames: return 0.0
-    # 取起始 EGO 位姿，沿车道中心线投影后与实际轨迹的最大偏差
-    start_tf = frames[0]["ego"]["tf"]
-    max_dev = 0.0
-    for f in frames:
-        ego_tf = f["ego"]["tf"]
-        wp = world_map.get_waypoint(ego_tf.location, project_to_road=True)
-        center = wp.transform.location
-        dev = math.hypot(ego_tf.location.x - center.x, ego_tf.location.y - center.y)
-        max_dev = max(max_dev, dev)
-    return max_dev
+def find_min_distance_window(frames, npc_id, win=2):
+    d_min = float('inf'); t_star = -1
+    for t in range(len(frames)):
+        npcs = frames[t]["npcs"]
+        if npc_id not in npcs:
+            continue
+        ego_tf = frames[t]["ego"]["tf"]; npc_tf = npcs[npc_id]["tf"]
+        dx = npc_tf.location.x - ego_tf.location.x
+        dy = npc_tf.location.y - ego_tf.location.y
+        d = math.hypot(dx, dy)
+        if d < d_min:
+            d_min = d; t_star = t
+    if t_star < 0:
+        return -1, [], float('inf')
+    i0 = max(0, t_star - win); i1 = min(len(frames) - 1, t_star + win)
+    return t_star, list(range(i0, i1 + 1)), d_min
 
-def compute_VOA(frames) -> float:
-    """最大加加速度（jerk）近似：1s 速度差分的二阶差分绝对值最大"""
-    if not frames: return 0.0
-    # 取每 1s 一个速度样本
-    t_step = max(1, int(1.0 / TIME_STEP))
-    v = []
-    for i in range(0, len(frames), t_step):
-        v.append(_speed_of(frames[i]["ego"]["vel"]))
-    if len(v) < 3: return 0.0
-    jerk = [abs((v[t] - v[t-1]) - (v[t-1]-v[t-2])) for t in range(2, len(v))]
-    return max(jerk) if jerk else 0.0
+def hazard_from_min_distance(frames, world_map, npc_id,
+                             D0=6.0, v0=0.5, sigma_v=1.0,
+                             w_dist=0.9, w_close=0.7, use_heading=False, w_head=0.3, win=2):
+    if not frames:
+        return 0.0
+    t_star, idxs, d_min = find_min_distance_window(frames, npc_id, win=win)
+    if t_star < 0 or not idxs:
+        return 0.0
 
-def compute_AEDF(frames, archive_trajs) -> float:
-    """与历史‘已发现违规’场景的 NPC 轨迹欧氏距离平均值（越大越多样）"""
-    if not frames or not archive_trajs: return 0.0
-    # 取当前场景中第一辆 NPC 的轨迹点（相对 EGO 起点）
-    ego0 = frames[0]["ego"]["tf"].location
-    cur_pts = []
-    for f in frames:
-        npcs = f["npcs"]
-        if not npcs: continue
-        any_npc = next(iter(npcs.values()))
-        loc = any_npc["tf"].location
-        cur_pts.append((loc.x - ego0.x, loc.y - ego0.y))
-    if not cur_pts: return 0.0
-    cur = np.array(cur_pts)
-    dists = []
-    for ref in archive_trajs:
-        m = min(len(cur), len(ref))
-        if m == 0: continue
-        d = np.linalg.norm(cur[:m] - ref[:m], axis=1).mean()
-        dists.append(d)
-    return float(np.mean(dists)) if dists else 0.0
+    # 碰撞近似：任一窗口帧距离 <1.5m 判 1
+    collided = False
+    v_closes = []
+    heads = []
+    for t in idxs:
+        ego_k = frames[t]["ego"]; npcs_k = frames[t]["npcs"]
+        if npc_id not in npcs_k:
+            continue
+        npc_k = npcs_k[npc_id]
+        dx = npc_k["tf"].location.x - ego_k["tf"].location.x
+        dy = npc_k["tf"].location.y - ego_k["tf"].location.y
+        if math.hypot(dx, dy) <= 1.5:
+            collided = True
+        v_closes.append(_closing_speed_at(ego_k["tf"], ego_k["vel"], npc_k["tf"], npc_k["vel"]))
+        if use_heading:
+            dyaw = npc_k["tf"].rotation.yaw - ego_k["tf"].rotation.yaw
+            while dyaw >= 180: dyaw -= 360
+            while dyaw < -180: dyaw += 360
+            heads.append((1.0 + math.cos(math.radians(dyaw))) * 0.5)
 
-# ====================== 连续仿真执行器 ======================
-class ScenarioExecutor:
-    def __init__(self, world, demo: MultiVehicleDemo):
-        self.world = world
-        self.demo = demo
-        self.world_map = world.get_map()
-        self.archive_trajs = []  # 违规样本 NPC 轨迹（用于 AEDF）
+    if collided:
+        return 1.0
 
-    def _spawn_from_rel(self, ego: carla.Actor, rel_list: List[Tuple[float,float,float]]):
-        ego_tf = ego.get_transform()
-        cy, sy = _yaw_to_unit(ego_tf.rotation.yaw)
-        spawns = []
-        for (ds, dd, dyaw) in rel_list:
-            # 局部坐标 -> 世界坐标
-            x = ego_tf.location.x + ds*cy - dd*sy
-            y = ego_tf.location.y + ds*sy + dd*cy
-            loc = carla.Location(x=x, y=y, z=ego_tf.location.z)
-            rot = carla.Rotation(yaw=ego_tf.rotation.yaw + dyaw)
-            spawns.append(carla.Transform(loc, rot))
-        ok = self.demo.setup_vehicles_with_collision({"spawn_points": spawns})
-        return ok
+    s_dist = math.exp(-min(d_min, 40.0) / D0)
+    v_bar = float(np.mean(v_closes)) if v_closes else 0.0
+    s_close = 1.0 / (1.0 + math.exp(-(v_bar - v0) / max(sigma_v, 1e-6)))
+    s_head = (float(np.mean(heads)) if (use_heading and heads) else 0.0)
 
-    def _apply_chromosomes(self, chroms: List[Chromosome], controller_by_id: Dict[int, object]):
-        """执行基因序列（按时间片循环）。模体在 plan() 时展开为原子序列。"""
-        expanded: Dict[int, List[AtomicGene]] = {}
-        for i, v in enumerate(self.demo.vehicles):
-            if v.id == self.demo.ego_vehicle.id: continue
-            seq: List[AtomicGene] = []
-            for g in chroms[i].genes:
-                if g.kind == "atomic":
-                    seq.append(g.payload)
-                else:
-                    seq.extend(g.payload.plan(self.world_map, self.demo.ego_vehicle, v))
-            expanded[v.id] = seq
+    prod = 1.0
+    for w, s in ((w_dist, s_dist), (w_close, s_close)):
+        prod *= (1.0 - w * max(0.0, min(1.0, s)))
+    if use_heading:
+        prod *= (1.0 - w_head * max(0.0, min(1.0, s_head)))
+    y_i = 1.0 - prod
+    return max(0.0, min(1.0, y_i))
 
-        # 同步推进：每步取各车当前基因的一个原子动作，按其 dur/TIME_STEP 执行
-        override = {vid: {"idx": 0, "left": (seq[0].dur if seq else 0.0)} for vid, seq in expanded.items()}
-        last_tick = time.monotonic()
-        while True:
-            self.world.wait_for_tick()
-            now = time.monotonic()
-            dt = max(TIME_STEP, now - last_tick)
-            last_tick = now
+# ====================== 数据集与训练 ======================
 
-            finished = 0
-            for vid, st in list(override.items()):
-                seq = expanded[vid]
-                if not seq: finished += 1; continue
-                idx = st["idx"]
-                if idx >= len(seq):
-                    finished += 1; continue
-                act = seq[idx].act
-                ctrl = controller_by_id.get(vid)
-                if ctrl: action_trans(ctrl, act)
-                st["left"] -= dt
-                if st["left"] <= 0:
-                    st["idx"] += 1
-                    if st["idx"] < len(seq):
-                        st["left"] = seq[st["idx"]].dur
-            if finished == len(expanded):
-                break
+def build_initial_pose_dataset_minDist(rec, world_map, surrogate_mlp,
+                                       D0=6.0, v0=0.5, sigma_v=1.0,
+                                       w_dist=0.9, w_close=0.7, use_heading=False, w_head=0.3, win=2):
+    F = rec.frames
+    if not F:
+        return np.zeros((0, 8), np.float32), np.zeros((0,), np.float32), []
+    t0 = 0
+    ego_tf0 = F[t0]["ego"]["tf"]
+    Xs, Ys, META = [], [], []
+    for nid, npc in F[t0]["npcs"].items():
+        npc_tf0 = npc["tf"]
+        feats = surrogate_mlp._build_feats(world_map, ego_tf0, npc_tf0)
+        y_i = hazard_from_min_distance(F, world_map, nid,
+                                       D0=D0, v0=v0, sigma_v=sigma_v,
+                                       w_dist=w_dist, w_close=w_close,
+                                       use_heading=use_heading, w_head=w_head, win=win)
+        Xs.append(feats); Ys.append(y_i)
+        ds0, dd0 = ego_local_sd(ego_tf0, npc_tf0.location)
+        dyaw0 = npc_tf0.rotation.yaw - ego_tf0.rotation.yaw
+        while dyaw0 >= 180: dyaw0 -= 360
+        while dyaw0 < -180: dyaw0 += 360
+        META.append({"npc_id": nid, "ds0": float(ds0), "dd0": float(dd0), "dyaw0": float(dyaw0)})
+    if not Xs:
+        return np.zeros((0, 8), np.float32), np.zeros((0,), np.float32), []
+    return np.asarray(Xs, np.float32), np.asarray(Ys, np.float32), META
 
-    def run(self, individual: ScenarioIndividual) -> Tuple[bool, EpisodeRecorder, Dict]:
-        """返回：(是否违规, 记录器, 统计)"""
-        demo = self.demo
-        world = self.world
-        rec = EpisodeRecorder(self.world_map)
 
-        # 重置环境（不重启 ADS，仅清场）
-        demo.destroy_all()
-        world.wait_for_tick()
+def train_mlp_initial_pose_minDist(surrogate_mlp: NPCHazardMLPSurrogate,
+                                   world_map, rec: EpisodeRecorder,
+                                   epochs=1, batch=256, lr=1e-3,
+                                   D0=6.0, v0=0.5, sigma_v=1.0,
+                                   w_dist=0.9, w_close=0.7, use_heading=False, w_head=0.3, win=2):
+    X, Y, META = build_initial_pose_dataset_minDist(rec, world_map, surrogate_mlp,
+                                                    D0=D0, v0=v0, sigma_v=sigma_v,
+                                                    w_dist=w_dist, w_close=w_close,
+                                                    use_heading=use_heading, w_head=w_head, win=win)
+    if X.shape[0] == 0:
+        return 0, 0.0, 0, (X, Y, META)
+    device = surrogate_mlp.device
+    model = surrogate_mlp.model
+    model.train()
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    bce = torch.nn.BCELoss(reduction='mean')
 
-        # 生成车辆
-        success = demo.setup_vehicles_with_collision({})  # 先只生成 EGO
-        if not success or demo.ego_vehicle is None:
-            return False, rec, {"spawn_ok": False}
+    idx = np.arange(len(Y))
+    total_steps, running = 0, 0.0
+    for _ in range(epochs):
+        np.random.shuffle(idx)
+        for i0 in range(0, len(idx), batch):
+            sel = idx[i0:i0 + batch]
+            x_t = torch.tensor(X[sel], device=device)
+            y_t = torch.tensor(Y[sel], device=device)
+            pred = model(x_t).squeeze(-1)
+            loss = bce(pred, y_t)
+            opt.zero_grad(); loss.backward(); opt.step()
+            total_steps += 1; running += float(loss.item())
+    model.eval()
+    avg_loss = running / max(total_steps, 1)
+    return total_steps, avg_loss, len(Y), (X, Y, META)
 
-        # 将 NPC 按相对位姿生成
-        if not self._spawn_from_rel(demo.ego_vehicle, individual.init_rel):
-            return False, rec, {"spawn_ok": False}
 
-        ego_id = demo.ego_vehicle.id
-        controllers = []
-        controller_by_actor_id = {}
-        for i, v in enumerate(demo.vehicles):
-            ctrl = demo.get_controller(i)
-            controllers.append(ctrl)
-            controller_by_actor_id[v.id] = ctrl
+def push_nearmiss_initial_to_replay(replay: NearMissReplay, dataset_tuple, min_tau=NEARMISS_SAVE_TAU, top_p=0.3, max_k=64):
+    X, Y, META = dataset_tuple
+    if len(Y) == 0:
+        return 0
+    order = np.argsort(-Y)
+    m = max(1, int(len(order) * top_p))
+    cnt = 0
+    for k in order[:m]:
+        if float(Y[k]) < min_tau:
+            break
+        replay.add_many([{
+            "ds": float(META[k]["ds0"]),
+            "dd": float(META[k]["dd0"]),
+            "dyaw": float(META[k]["dyaw0"]),
+            "F": float(Y[k])
+        }])
+        cnt += 1
+        if cnt >= max_k:
+            break
+    return cnt
 
-        # 上 TM
-        tm = world.get_client().get_trafficmanager(8000)
-        for v in demo.vehicles:
-            if v.id != ego_id:
-                v.set_autopilot(True, tm.get_port())
-                tm.vehicle_percentage_speed_difference(v, random.randint(-10, 15))
-                tm.distance_to_leading_vehicle(v, 2.5)
+# ====================== JSON 序列化工具 ======================
 
-        # 开始计时
-        wall_start = time.monotonic()
-        progress_anchor_loc = None
-        progress_anchor_t = wall_start
-
-        # 预热
-        for step in range(STARTUP_STEPS):
-            world.wait_for_tick()
-
-        # 目的地（若需要）
-        if demo.external_ads:
-            demo.set_destination()
-            progress_anchor_loc = demo.ego_vehicle.get_location()
-            progress_anchor_t = time.monotonic()
-
-        violated = False
-        violation_reason = ""
-
-        # 执行基因序列
-        self._apply_chromosomes(individual.chroms, controller_by_actor_id)
-
-        # 主循环：采集状态 + 违规判定 + 早退
-        for step in range(50000):
-            world.wait_for_tick()
-            if time.monotonic() - wall_start > EPISODE_MAX_SECONDS:
-                violation_reason = "timeout"
-                break
-
-            # 统计 + 碰撞监听
-            signals_list, ego_collision, all_collision, cross_solid_line, red_light = demo.tick()
-            if ego_collision or all_collision:
-                violated = True
-                violation_reason = "collision"
-                break
-            if red_light:
-                violated = True
-                violation_reason = "red_light"
-                break
-
-            # 进度超时
-            ego_loc = demo.ego_vehicle.get_location()
-            if progress_anchor_loc is not None:
-                moved = math.hypot(ego_loc.x - progress_anchor_loc.x, ego_loc.y - progress_anchor_loc.y)
-                if moved >= PROGRESS_THRESH:
-                    progress_anchor_loc = ego_loc
-                    progress_anchor_t = time.monotonic()
-                elif time.monotonic() - progress_anchor_t > NO_PROGRESS_SECONDS:
-                    violation_reason = "no_progress"
-                    break
-
-            # 记录
-            rec.log(demo.ego_vehicle, demo.vehicles)
-
-            # 到达即结束
-            if demo.ego_destination is not None:
-                near_dest, pass_dest = has_passed_destination(demo.ego_vehicle, demo.ego_destination, self.world_map)
-                if near_dest: break
-
-        # 清 Apollo 缓存
-        try:
-            apollo_clear_prediction_planning(times=2, interval=0.05)
-        except Exception:
-            pass
-
-        # 保存违规轨迹到档案（用于 AEDF）
-        if violated and rec.frames:
-            ego0 = rec.frames[0]["ego"]["tf"].location
-            traj = []
-            for f in rec.frames:
-                npcs = f["npcs"]
-                if not npcs: continue
-                any_npc = next(iter(npcs.values()))
-                loc = any_npc["tf"].location
-                traj.append([loc.x - ego0.x, loc.y - ego0.y])
-            self.archive_trajs.append(np.array(traj, dtype=np.float32))
-
-        # 清场（保留 EGO 以连续运行可继续实现；此处简单清空）
-        keep_ids = {demo.ego_vehicle.id} if demo.ego_vehicle else set()
-        purge_npcs(world, world.get_client(), tm=None, keep_actor_ids=keep_ids,
-                   include_walkers=True, hard_teleport=True)
-
-        return violated, rec, {"spawn_ok": True, "reason": violation_reason}
-
-# ====================== MOSAT 搜索器 ======================
-class MOSATSearchEngine:
-    def __init__(self, world, demo):
-        self.world = world
-        self.demo = demo
-        self.executor = ScenarioExecutor(world, demo)
-        self.generation = 1
-        self.archive = []  # 违规场景归档（用于 AEDF）
-        self.stagnation = 0
-        self.last_front_signature = None
-
-    def _evaluate(self, ind: ScenarioIndividual, rec: EpisodeRecorder, violated: bool):
-        # 计算四目标
-        METTC = compute_METTC(rec.frames)
-        DFP = compute_DFP(rec.frames, self.world.get_map())
-        VOA = compute_VOA(rec.frames)
-        AEDF = compute_AEDF(rec.frames, self.executor.archive_trajs)
-        # NSGA-II 统一按“越小越好”排序：对最大化项取负
-        ind.fitness = (METTC, -DFP, -VOA, -AEDF)
-        ind.violated = violated
-
-    def initial_population(self) -> List[ScenarioIndividual]:
-        n = random.randint(NPC_PER_SCEN_MIN, NPC_PER_SCEN_MAX)
-        return [random_individual(n) for _ in range(POP_SIZE)]
-
-    def variation(self, parents: List[ScenarioIndividual]) -> List[ScenarioIndividual]:
-        children: List[ScenarioIndividual] = []
-
-        # —— 按个体层面交叉 —— #
-        crossed_pool = []
-        for p in parents:
-            if random.random() < P_CROSS:
-                crossed_pool.append(p)
-        random.shuffle(crossed_pool)
-        for i in range(0, len(crossed_pool)-1, 2):
-            c1, c2 = uniform_crossover(crossed_pool[i], crossed_pool[i+1])
-            children.extend([c1, c2])
-
-        # —— 逐个体应用“内变异” —— #
-        for p in parents:
-            child = random_individual(len(p.chroms))  # 先拷一份结构
-            child.chroms = [Chromosome([Gene(g.kind, g.payload) for g in ch.genes]) for ch in p.chroms]
-            child.init_rel = list(p.init_rel)
-
-            if not p.violated:
-                # 未违规：对“最小 ETTC 基因”做定向变异
-                # 这里用启发式：挑随机染色体 & 基因位点进行一次变异
-                ch_idx = random.randrange(len(child.chroms))
-                gi = random.randrange(len(child.chroms[ch_idx].genes))
-                gene_mutation_min_ettc(child, ch_idx, gi)
-            else:
-                # 已违规：增加多样性 —— 双点交叉或洗牌
-                if random.random() < P_MUT:
-                    two_point_crossover_inside(child)
-                else:
-                    shuffle_inside(child)
-            children.append(child)
-        return children
-
-    def restart_if_needed(self, pop: List[ScenarioIndividual]) -> List[ScenarioIndividual]:
-        # 若连续若干代的第一前沿（按 fitness 排序）未变化，则重启
-        fronts = fast_non_dominated_sort(pop)
-        top = sorted([tuple(ind.fitness) for ind in fronts[0]])
-        sig = tuple(top)
-        if sig == self.last_front_signature:
-            self.stagnation += 1
-        else:
-            self.stagnation = 0
-            self.last_front_signature = sig
-        if self.stagnation >= STAGNATION_RESTART:
-            self.stagnation = 0
-            self.last_front_signature = None
-            return self.initial_population()
-        return pop
-
-    def run(self, budget_episodes=10000):
-        # 初始种群
-        population = self.initial_population()
-        episodes = 0
-
-        while episodes < budget_episodes and self.generation <= MAX_GENERATIONS:
-            evaluated = []
-            # —— 连续仿真：依次执行本代所有个体 —— #
-            for ind in population:
-                violated, rec, stat = self.executor.run(ind)
-                self._evaluate(ind, rec, violated)
-                # 记录违规样本
-                if violated:
-                    append_jsonl(RECORD_JSONL, {
-                        "gen": self.generation,
-                        "fitness": ind.fitness,
-                        "violated": True,
-                        "reason": stat.get("reason",""),
-                        "ts": time.time()
-                    })
-                evaluated.append(ind)
-                episodes += 1
-                if episodes >= budget_episodes: break
-
-            # —— 选择（NSGA-II） —— #
-            population = nsga2_select(evaluated, POP_SIZE)
-            # —— 变异/交叉 —— #
-            children = self.variation(population)
-            population = nsga2_select(population + children, POP_SIZE)
-            # —— 停滞重启 —— #
-            population = self.restart_if_needed(population)
-
-            print(f"[MOSAT] Generation {self.generation} done, episodes={episodes}")
-            self.generation += 1
-
-# ====================== I/O 工具 ======================
 def _to_jsonable(x):
     try:
         import carla as _carla
@@ -710,18 +378,20 @@ def _to_jsonable(x):
         except Exception: pass
     return x
 
+
 def append_jsonl(path: str, obj: dict):
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
-# ====================== 主入口 ======================
+# ====================== 主程序 ======================
+
 def main():
     client = carla.Client("localhost", 2000)
     client.set_timeout(10.0)
     world = client.get_world()
+    COLLIDED_JSONL = "collided_scenarios.jsonl"
 
-    # 交通灯全绿（可保留）
+    # 交通灯全绿
     for actor in world.get_actors():
         if isinstance(actor, carla.TrafficLight):
             actor.set_state(carla.TrafficLightState.Green)
@@ -731,14 +401,392 @@ def main():
     tm.set_synchronous_mode(True)
     tm.set_random_device_seed(42)
 
-    demo = MultiVehicleDemo(world, external_ads=True)
+    external_ads = True
+    demo = MultiVehicleDemo(world, external_ads)
+    world_map = world.get_map()
 
-    # MOSAT 搜索
-    engine = MOSATSearchEngine(world, demo)
-    engine.run(budget_episodes=400)  # 与原 Test_buget 对齐
+    surrogate = NPCHazardMLPSurrogate(ckpt_path="mlp_frozen.pt")
 
+    camera = None
+    image_queue = None
+
+    Test_buget = 400
+    number_game = 1
+    side_total = 0
+    timeout_total = 0
+    red_light_total = 0
+    obj_collison_total = 0
+    cross_solid_line_total = 0
+
+    current_generation = 1
+    GA = CombinedGA(carla_map=world_map, population_size=population_size)
+    GA.sample_initial_population()
+    scenario_confs = GA.population
+
+    gen_records = []  # {idx, peak_F, collided, pos_info}
+
+    while number_game <= Test_buget:
+        abnormal_case = False
+        # === 从 GA 拿一个 seed（position_info） ===
+        idx_in_pop = (number_game - 1) % population_size
+        if len(scenario_confs) == population_size:
+            scenario_conf = scenario_confs[idx_in_pop]["position_info"]
+        else:
+            scenario_conf = scenario_confs[idx_in_pop + population_size]["position_info"]
+
+        success = demo.setup_vehicles_with_collision(scenario_conf)
+        if not success:
+            print("[ERROR] 车辆生成失败，跳过（不计入有效回合）。")
+            scenario_confs[idx_in_pop] = GA.resample()
+            continue
+
+        actual_n = len(demo.vehicles)
+        demo.vehicle_num = actual_n
+        if actual_n < MIN_NPC:
+            print(f"[WARN] only {actual_n} NPC spawned (<{MIN_NPC}), 回滚重采样。")
+            demo.destroy_all()
+            scenario_confs[idx_in_pop] = GA.resample()
+            continue
+
+        print(f"[INFO] 请求 {scenario_conf.get('vehicle_num','?')}，实际生成 {actual_n} (有效回合序号 {number_game})")
+
+        controllers = []
+        controller_by_actor_id = {}
+        for i, v in enumerate(demo.vehicles):
+            ctrl = demo.get_controller(i)
+            controllers.append(ctrl)
+            controller_by_actor_id[v.id] = ctrl
+
+        if not demo.external_ads:
+            demo.ego_vehicle.set_autopilot(True, tm.get_port())
+            tm.vehicle_percentage_speed_difference(demo.ego_vehicle, 5)
+
+        # 所有 NPC 上 TM
+        ego_id = demo.ego_vehicle.id if demo.ego_vehicle is not None else -1
+        for v in demo.vehicles:
+            if v.id != ego_id:
+                v.set_autopilot(True, tm.get_port())
+                tm.vehicle_percentage_speed_difference(v, random.randint(-10, 20))
+                tm.ignore_signs_percentage(v, 0)
+                tm.ignore_lights_percentage(v, 0)
+                tm.ignore_walkers_percentage(v, 0)
+                tm.distance_to_leading_vehicle(v, 2.5)
+
+        # 录像
+        if RECORDING:
+            camera_bp = world.get_blueprint_library().find('sensor.camera.rgb')
+            camera_bp.set_attribute('image_size_x', '640')
+            camera_bp.set_attribute('image_size_y', '360')
+            camera_bp.set_attribute('fov', '90')
+            spectator = world.get_spectator()
+            image_queue = Queue()
+
+            def camera_callback(image, image_queue):
+                array = np.frombuffer(image.raw_data, dtype=np.uint8)
+                array = array.reshape((image.height, image.width, 4))
+                image_queue.put(array)
+
+            camera = world.spawn_actor(
+                camera_bp,
+                carla.Transform(spectator.get_transform().location, spectator.get_transform().rotation)
+            )
+            camera.listen(lambda data: camera_callback(data, image_queue))
+            save_dir = f"recording/episode_{number_game}"
+            os.makedirs(save_dir, exist_ok=True)
+        else:
+            save_dir = f"recording/episode_{number_game}"
+            camera = None
+            image_queue = None
+
+        wall_start = time.monotonic()
+        progress_anchor_loc = None
+        progress_anchor_t = wall_start
+        timeout_cnt = 0
+        start_loc = None
+
+        # MOSAT 运行期状态（替换原 ART）
+        mosat_sequences = None   # dict[vid] -> [{"act": str, "steps": int}, ...]
+        mosat_state = {}         # vid -> {"i": 0, "left": steps}
+
+        # 回放记录器
+        rec = EpisodeRecorder(world_map)
+
+        for mod in demo.modules:
+            demo.enable_module(mod)
+
+        # ========== 主循环 ==========
+        for step in range(50000):
+            world.wait_for_tick()
+
+            if time.monotonic() - wall_start > EPISODE_MAX_SECONDS:
+                print(f"[EARLY-EXIT] episode wall-clock > {EPISODE_MAX_SECONDS}s, stop.")
+                break
+
+            # 启动阶段
+            if step < STARTUP_STEPS:
+                ego_vel = demo.ego_vehicle.get_velocity()
+                speed_ego = math.sqrt(ego_vel.x ** 2 + ego_vel.y ** 2 + ego_vel.z ** 2)
+                if speed_ego > 5:
+                    print('[WARN] EGO 启动阶段速度异常偏高，结束该轮。')
+                    abnormal_case = True
+            if step == STARTUP_STEPS and demo.external_ads:
+                start_loc = demo.ego_vehicle.get_location()
+                progress_anchor_loc = start_loc
+                progress_anchor_t = time.monotonic()
+                demo.set_destination()
+
+            if step > STARTUP_STEPS:
+                # TM 续权（排除正在接管的 NPC）
+                if step % KEEP_ALIVE_PERIOD == 0:
+                    for v in demo.vehicles:
+                        if v.id == ego_id or (v.id in mosat_state):
+                            continue
+                        v.set_autopilot(True, tm.get_port())
+                        tm.vehicle_percentage_speed_difference(v, random.randint(-10, 20))
+                        tm.ignore_signs_percentage(v, 0)
+                        tm.ignore_lights_percentage(v, 0)
+                        tm.ignore_walkers_percentage(v, 0)
+                        tm.distance_to_leading_vehicle(v, 2.5)
+
+                # 非阻塞录像
+                if RECORDING and image_queue is not None:
+                    try:
+                        frame = image_queue.get_nowait()
+                        cv2.imwrite(os.path.join(save_dir, f"frame_{step}.png"), frame)
+                        spectator = world.get_spectator()
+                        camera.set_transform(spectator.get_transform())
+                    except Exception:
+                        pass
+
+                # 无进展超时
+                ego_loc = demo.ego_vehicle.get_location()
+                if progress_anchor_loc is not None:
+                    moved = math.hypot(ego_loc.x - progress_anchor_loc.x, ego_loc.y - progress_anchor_loc.y)
+                    if moved >= PROGRESS_THRESH:
+                        progress_anchor_loc = ego_loc
+                        progress_anchor_t = time.monotonic()
+                    elif time.monotonic() - progress_anchor_t > NO_PROGRESS_SECONDS:
+                        print(f"[EARLY-EXIT] no progress for {NO_PROGRESS_SECONDS}s (Δ={moved:.2f}m).")
+                        timeout_cnt = 1
+                        break
+
+                # 到达或越过目的地
+                if demo.ego_destination is not None:
+                    near_dest, pass_dest = has_passed_destination(demo.ego_vehicle, demo.ego_destination, world_map)
+                    if step != 0 and demo.external_ads and near_dest:
+                        print('Arrive, episode end')
+                        break
+                    else:
+                        if pass_dest:
+                            for mod in demo.modules: demo.enable_module(mod)
+                            print('pass destination error'); abnormal_case = True
+
+                # 摄像机跟随
+                spectator = world.get_spectator()
+                trans = demo.ego_vehicle.get_transform()
+                loc = trans.location
+                yaw_deg = trans.rotation.yaw
+                yaw_rad = math.radians(yaw_deg)
+                offset_x = -10.0; offset_z = 5.0
+                cam_x = loc.x + offset_x * math.cos(yaw_rad)
+                cam_y = loc.y + offset_x * math.sin(yaw_rad)
+                cam_z = loc.z + offset_z
+                spectator.set_transform(carla.Transform(
+                    carla.Location(cam_x, cam_y, cam_z),
+                    carla.Rotation(pitch=-20, yaw=yaw_deg)
+                ))
+
+                # 记录一帧
+                rec.log(demo.ego_vehicle, demo.vehicles)
+
+                # ========== MOSAT：按模体计划执行原子动作序列（替换 ART 块） ==========
+                # 第一次进入执行时生成计划（基于当下相对构型）
+                if (mosat_sequences is None) and (step == STARTUP_STEPS + 1):
+                    mosat_sequences = mosat_plan_sequences(world_map, demo.ego_vehicle, demo.vehicles)
+                    mosat_state = {}
+                    for vid, seq in mosat_sequences.items():
+                        if len(seq) > 0:
+                            mosat_state[vid] = {"i": 0, "left": seq[0]["steps"]}
+
+                # 可选：每隔固定步长滚动重规划（让干扰更持久）
+                # if (step > STARTUP_STEPS) and (step % 200 == 0):
+                #     mosat_sequences = mosat_plan_sequences(world_map, demo.ego_vehicle, demo.vehicles)
+                #     mosat_state.clear()
+                #     for vid, seq in mosat_sequences.items():
+                #         if len(seq) > 0:
+                #             mosat_state[vid] = {"i": 0, "left": seq[0]["steps"]}
+
+                # 推进 MOSAT 序列
+                if mosat_sequences is not None:
+                    finished_vids = []
+                    for v in demo.vehicles:
+                        if v.id == ego_id:
+                            continue
+                        seq = mosat_sequences.get(v.id, [])
+                        st = mosat_state.get(v.id)
+                        if not seq or st is None:
+                            # 没有序列则回到 TM
+                            v.set_autopilot(True, tm.get_port())
+                            continue
+
+                        # 当前原子动作
+                        idx = st["i"]
+                        if idx >= len(seq):
+                            # 序列结束 -> 交还 TM
+                            v.set_autopilot(True, tm.get_port())
+                            finished_vids.append(v.id)
+                            continue
+
+                        act_name = seq[idx]["act"]
+                        ctrl = controller_by_actor_id.get(v.id)
+                        if ctrl is not None:
+                            v.set_autopilot(False)
+                            action_trans(ctrl, act_name)
+
+                        # 递减剩余步计数
+                        st["left"] -= 1
+                        if st["left"] <= 0:
+                            st["i"] += 1
+                            if st["i"] < len(seq):
+                                st["left"] = seq[st["i"]]["steps"]
+                            else:
+                                # 执行完毕，标记回 TM
+                                v.set_autopilot(True, tm.get_port())
+                                finished_vids.append(v.id)
+
+                    # 清理已完成
+                    for vid in finished_vids:
+                        mosat_state.pop(vid, None)
+
+                # 环境统计（若碰撞，立即早退）
+                signals_list, ego_collision, all_collision, cross_solid_line, red_light = demo.tick()
+                if ego_collision or all_collision:
+                    print("[EARLY-EXIT] collision detected. Ending episode immediately.")
+                    break
+
+        # episode 尾：清空 apollo 的 prediction/planning 缓存（若有）
+        try:
+            apollo_clear_prediction_planning(times=3, interval=0.05)
+        except Exception as e:
+            print(f"[WARN] apollo_clear_prediction_planning failed: {e}")
+
+        for _ in range(300):
+            world.wait_for_tick()
+
+        if RECORDING and camera is not None:
+            try:
+                camera.stop(); camera.destroy()
+            except Exception:
+                pass
+
+        # 结束检查
+        end_loc = demo.ego_vehicle.get_location()
+        if start_loc is not None:
+            distance_to_start = math.dist([start_loc.x, start_loc.y], [end_loc.x, end_loc.y])
+        else:
+            distance_to_start = 0.0
+        print('Moved distance: ', distance_to_start)
+        if distance_to_start < 1:
+            print("[WARNING] EGO 起点与终点距离 < 1m，判定异常，不计入本代。")
+            abnormal_case = True
+
+        # 统计 + GA 演化（仅对有效回合）
+        if not abnormal_case:
+            side_total += demo.side_collision_count_vehicle
+            obj_collison_total = demo.collision_count_obj
+            timeout_total += timeout_cnt
+            red_light_total += demo.ego_run_red_light
+            cross_solid_line_total += demo.ego_cross_solid_line
+
+            # 记录（含是否发生车辆侧碰）
+            jsonable_conf = _to_jsonable(scenario_conf)
+            collided_record = {
+                "ts": datetime.now().isoformat(),
+                "episode": number_game,
+                "side_collision": demo.side_collision_count_vehicle,
+                "object collision": demo.collision_count_obj,
+                "timeout": timeout_cnt,
+                "red_light": demo.ego_run_red_light,
+                "cross_solid": demo.ego_cross_solid_line,
+                "scenario_conf": jsonable_conf
+            }
+            append_jsonl(COLLIDED_JSONL, collided_record)
+            print(f"[SAVED] scenario appended to {COLLIDED_JSONL}")
+            if demo.side_collision_count_vehicle == 0 and RECORDING and os.path.isdir(save_dir):
+                shutil.rmtree(save_dir)
+
+            gen_records.append({
+                "idx": number_game,
+                "collided": bool(demo.side_collision_count_vehicle),
+                "pos_info": scenario_conf
+            })
+
+            # —— “半代”扩充（父代选择 + 交叉/变异）——
+            if (number_game % population_size) == 0 and (number_game % (2 * population_size) != 0):
+                # diversity
+                diversity = []
+                for individual in scenario_confs:
+                    eu_dis = average_population_distance(individual, scenario_confs)
+                    diversity.append(-eu_dis)
+                fitness = {"safety_violation": [], "diversity": diversity, "ART_trigger_time": []}
+                # 用是否碰撞作为粗安全信号（仅示意，不影响 GA 内部排序接口）
+                for rec_i in gen_records:
+                    fitness["safety_violation"].append(-1 if rec_i["collided"] else 1)
+                    fitness["ART_trigger_time"].append(0)  # MOSAT 不再统计 ART 触发，填 0
+                print(fitness)
+                parents = parents_selection(fitness, scenario_confs, population_size)
+                for i in range(0, population_size, 2):
+                    parent_1, parent_2 = parents[i], parents[i + 1]
+                    child_1, child_2 = GA.crossover_individuals(parent_1, parent_2)
+
+                    child_1 = GA.mutation(child_1)
+                    child_2 = GA.mutation(child_2)
+                    scenario_confs.append(child_1)
+                    scenario_confs.append(child_2)
+
+            # —— 整代结束：SVGD 注入 + 下一代 ——
+            if (number_game % (2 * population_size)) == 0:
+
+                diversity = []
+                for individual in scenario_confs:
+                    eu_dis = average_population_distance(individual, scenario_confs)
+                    diversity.append(-eu_dis)
+                fitness["diversity"] = diversity
+                for r in gen_records:
+                    fitness["safety_violation"].append(-1 if r["collided"] else 1)
+                    fitness["ART_trigger_time"].append(0)  # MOSAT 无 ART
+                scenario_confs = next_gen_selection(fitness, scenario_confs, population_size)
+
+                gen_records.clear()
+                print(f"Generation {current_generation} end")
+                current_generation += 1
+
+            number_game += 1
+        else:
+            if RECORDING and os.path.isdir(save_dir):
+                shutil.rmtree(save_dir)
+            if len(scenario_confs) == population_size:
+                scenario_confs[idx_in_pop] = GA.resample()
+            else:
+                scenario_confs[idx_in_pop + population_size] = GA.resample()
+
+            print(f"[INFO] 本轮异常，已回滚重采样（不计入有效回合）。")
+
+        demo.destroy_all()
+
+        keep_ids = {demo.ego_vehicle.id} if demo.ego_vehicle else set()
+        rem_veh, rem_walk = purge_npcs(world, client, tm=tm, keep_actor_ids=keep_ids,
+                                       include_walkers=True, hard_teleport=True)
+        print(f"[PURGE] left vehicles={rem_veh}, walkers={rem_walk}")
+
+    # ---- 结束统计 ----
+    print('Side collision (ego×vehicle):', side_total)
+    print('Ego vehicle object collision:', obj_collison_total)
+    print('Time Out:', timeout_total)
+    print('red light:', red_light_total)
     demo.destroy_all(); demo.close_connection()
-    print("[MOSAT] Cleanup done.")
+    print("Cleanup done.")
+
 
 if __name__ == "__main__":
     main()

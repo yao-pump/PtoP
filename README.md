@@ -9,7 +9,7 @@ Beyond seed generation, PtoP functions as a plug-and-play framework that integra
 
 We evaluate PtoP in **CARLA**—a state-of-the-art simulator—on two ADS implementations: an industry-grade stack (**Apollo**) and an end-to-end ADS native to CARLA. When combined with state-of-the-art baselines, PtoP substantially improves performance: safety-violation rate (up to **+27.68%**), diversity (up to **+9.6%**), and map coverage (up to **+16.78%**). These results highlight PtoP as an efficient, principled approach to synthesizing realistic, hard-to-find hazardous scenarios for ADS validation.
 
-[//]: # (<img src="https://github.com/asvonavnsnvononaon/AutoMT/blob/main/Images/ASE_overall.jpg" width="60%"/>)
+
 
 ## 📖 Table of Contents
 
@@ -81,3 +81,4 @@ Install the **CARLA-Apollo Bridge** from: [CARLA Apollo Bridge](https://github.c
 
 ## Baselines
 Baseline implementations are provided in the baseline/ folder.
+
