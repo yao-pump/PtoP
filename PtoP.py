@@ -33,9 +33,7 @@ from world import MultiVehicleDemo
 from ART_SEED_GENERATOR import seed_generator
 
 from npc_svgd_runtime import RuntimeNPCSVGD
-from ART_fuzzer import (
-    ARTSelectorScenario, update_adaptive_policy, filter_triggerables, build_actions_for
-)
+
 
 K_ATTACK = 3      # 对抗 NPC 数（车与人各自最多 K 个）
 
@@ -538,7 +536,7 @@ def main():
     world_map = world.get_map()
 
     surrogate = NPCHazardMLPSurrogate(ckpt_path="mlp_frozen.pt")
-    art = ARTSelectorScenario()
+
 
     camera = None
     image_queue = None

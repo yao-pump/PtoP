@@ -30,7 +30,7 @@ from offline_searcher import CombinedGA
 from npc_surrogate_mlp import NPCHazardMLPSurrogate
 from npc_svgd_runtime import RuntimeNPCSVGD
 from replay_buffer import NearMissReplay
-from ART_fuzzer import (
+from RL import (
     ARTSelectorScenario, update_adaptive_policy, filter_triggerables, build_actions_for
 )
 
