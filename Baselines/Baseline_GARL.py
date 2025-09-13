@@ -3,7 +3,7 @@
 """
 主程序（完整可运行骨架）：
 - GA 采样 + 代末 SVGD 微调（对 NPC 初始 (ds, dd, dyaw)）
-- ART（sb_art.py）在线操控 NPC（自适应策略 + 组合动作）
+- RL（DQN）在线操控 NPC（替换原 ART，自适应策略 + 组合动作）
 - MLP surrogate：输入 = 起点特征，标签 = episode 内 NPC 与 EGO 最近距离时刻的 hazard（min-distance 方案）
 - 在线每回合 1-2 epoch 微调；可选 EMA（若 surrogate 提供 ema_update）
 """
@@ -30,9 +30,8 @@ from offline_searcher import CombinedGA
 from npc_surrogate_mlp import NPCHazardMLPSurrogate
 from npc_svgd_runtime import RuntimeNPCSVGD
 from replay_buffer import NearMissReplay
-from RL import (
-    ARTSelectorScenario, update_adaptive_policy, filter_triggerables, build_actions_for
-)
+# ====== 仅替换为 DQN（其余保持不动） ======
+from dqn_agent import DQNAgent
 
 # ====================== 全局超参数 ======================
 TIME_STEP = 0.05
@@ -67,7 +66,7 @@ MIN_SEP = 3.5
 # —— 生成数量最低门槛（实际生成太少直接回滚） —— #
 MIN_NPC = 20
 
-# —— ART 步长 —— #
+# —— 动作步长表（与原始一致） —— #
 SBART_STEPS_BASE = {
     "break": 10,
     "accelerate": 4,
@@ -305,6 +304,130 @@ def append_jsonl(path: str, obj: dict):
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
+# ====================== RL（DQN）控制器：仅新增 ======================
+
+# 离散动作集合（含 keep 保持不接管）
+RL_ACTIONS = [
+    "keep",
+    "break",
+    "accelerate",
+    "left_change_acc",
+    "left_change_dec",
+    "right_change_acc",
+    "right_change_dec",
+]
+
+def _wrap_angle180(a):
+    while a >= 180: a -= 360
+    while a < -180: a += 360
+    return a
+
+class RLNPCController:
+    """用 DQN 选择与训练对 NPC 的接管动作（共享一个 agent）。"""
+    def __init__(self, agent: DQNAgent, world_map, surrogate: NPCHazardMLPSurrogate,
+                 device=None, top_k=3, hazard_thresh=0.15):
+        self.agent = agent
+        self.world_map = world_map
+        self.surrogate = surrogate
+        self.device = device or torch.device("cpu")
+        self.top_k = top_k
+        self.hazard_thresh = hazard_thresh
+        # 记录上一步被接管的 NPC：vid -> {"obs": np.ndarray, "a": int}
+        self.traces = {}
+
+    @torch.no_grad()
+    def _surrogate_hazard_prob(self, ego_tf, npc_tf):
+        # 与你训练时一致：模型输出已是概率（训练里用 BCELoss 而非 logits）
+        feats = self.surrogate._build_feats(self.world_map, ego_tf, npc_tf)
+        x = torch.tensor(feats, dtype=torch.float32, device=self.device).unsqueeze(0)
+        p = float(self.surrogate.model(x).view(-1).item())
+        return max(0.0, min(1.0, p))
+
+    def _closing_speed_and_ttc(self, ego_tf, ego_vel, npc_tf, npc_vel):
+        v_close = _closing_speed_at(ego_tf, ego_vel, npc_tf, npc_vel)
+        ds = ego_local_sd(ego_tf, npc_tf.location)[0]
+        ttc = (ds / v_close) if (v_close > 1e-3 and ds > 0) else 0.0
+        return v_close, ttc
+
+    def _build_obs(self, ego, npc):
+        ego_tf = ego.get_transform()
+        npc_tf = npc.get_transform()
+        ds, dd = ego_local_sd(ego_tf, npc_tf.location)
+        dyaw = _wrap_angle180(npc_tf.rotation.yaw - ego_tf.rotation.yaw)
+        ev = ego.get_velocity(); nv = npc.get_velocity()
+        ego_speed = math.sqrt(ev.x**2 + ev.y**2 + ev.z**2)
+        npc_speed = math.sqrt(nv.x**2 + nv.y**2 + nv.z**2)
+        v_close, ttc = self._closing_speed_and_ttc(
+            ego_tf, (ev.x, ev.y, ev.z), npc_tf, (nv.x, nv.y, nv.z)
+        )
+        obs = np.array([
+            np.clip(ds / max(DS_LIM, 1e-6), -1.5, 1.5),
+            np.clip(dd / max(DD_LIM, 1e-6), -1.5, 1.5),
+            dyaw / 180.0,
+            np.tanh(ego_speed / 15.0),
+            np.tanh(npc_speed / 15.0),
+            np.tanh(v_close / 10.0),
+            0.0 if ttc <= 0 else np.tanh(1.0 / max(ttc, 1e-6)),
+            1.0 if ds > 0 else -1.0,
+            math.cos(math.radians(dyaw)),
+            math.sin(math.radians(dyaw)),
+        ], dtype=np.float32)
+        return obs
+
+    @torch.no_grad()
+    def select_and_record(self, ego, vehicles):
+        """选择要接管的 NPC，并返回 [(v, act_name)]；同时把 (s,a) 放进 traces。"""
+        ego_id = ego.id
+        scored = []
+        ego_tf = ego.get_transform()
+        for v in vehicles:
+            if v.id == ego_id:
+                continue
+            npc_tf = v.get_transform()
+            p = self._surrogate_hazard_prob(ego_tf, npc_tf)
+            if p >= self.hazard_thresh:
+                scored.append((v, p))
+        if not scored:
+            return []
+        scored.sort(key=lambda x: -x[1])
+        chosen = []
+        for v, _ in scored[: self.top_k]:
+            obs = self._build_obs(ego, v)
+            a = self.agent.select_action(obs)
+            act = RL_ACTIONS[a]
+            if act != "keep":
+                chosen.append((v, act))
+                self.traces[v.id] = {"obs": obs, "a": int(a)}
+        return chosen
+
+    def post_tick_update(self, ego, vehicles, collided: bool):
+        """
+        每 tick 调用：为 traces 内记录的 (s,a) 生成 (s', r, done)，写入重放并优化。
+        奖励: r = p_hazard_next + 1.0*I[collided] - 0.01
+        """
+        if not self.traces:
+            return
+        ego_tf = ego.get_transform()
+        next_obs_by_vid = {}
+        for v in vehicles:
+            if v.id in self.traces:
+                next_obs_by_vid[v.id] = self._build_obs(ego, v)
+        hazard_next = {}
+        for vid in list(next_obs_by_vid.keys()):
+            v = next((x for x in vehicles if x.id == vid), None)
+            if v is None:
+                continue
+            p = self._surrogate_hazard_prob(ego_tf, v.get_transform())
+            hazard_next[vid] = float(p)
+        for vid, item in list(self.traces.items()):
+            s = item["obs"]; a = item["a"]
+            s2 = next_obs_by_vid.get(vid, s)
+            r = hazard_next.get(vid, 0.0) + (1.0 if collided else 0.0) - 0.01
+            done = bool(collided)
+            self.agent.push(s, a, r, s2, done)
+            _ = self.agent.optimize()
+            self.traces.pop(vid, None)
+
 # ====================== 主程序 ======================
 
 def main():
@@ -329,8 +452,26 @@ def main():
 
     surrogate = NPCHazardMLPSurrogate(ckpt_path="mlp_frozen.pt")
 
-
-    art = ARTSelectorScenario()
+    # ====== 新增：DQN 初始化（替代 ART） ======
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dqn = DQNAgent(
+        obs_dim=10,
+        n_actions=len(RL_ACTIONS),
+        device=device,
+        lr=1e-3, gamma=0.99,
+        batch_size=128,
+        target_update_interval=1000,
+        replay_capacity=100_000,
+        eps_start=0.20, eps_end=0.02, eps_decay_steps=50_000,
+        grad_clip=5.0,
+    )
+    try:
+        dqn.load("dqn.pt")
+        print("[DQN] loaded checkpoint: dqn.pt")
+    except Exception as e:
+        print("[DQN] no checkpoint found:", e)
+    rl_ctrl = RLNPCController(dqn, world_map, surrogate, device=device,
+                              top_k=3, hazard_thresh=0.15)
 
     camera = None
     image_queue = None
@@ -358,7 +499,6 @@ def main():
             scenario_conf = scenario_confs[idx_in_pop]["position_info"]
         else:
             scenario_conf = scenario_confs[idx_in_pop + population_size]["position_info"]
-
 
         success = demo.setup_vehicles_with_collision(scenario_conf)
         if not success:
@@ -430,7 +570,7 @@ def main():
         timeout_cnt = 0
         start_loc = None
 
-        # ART 运行期状态
+        # RL 运行期状态（沿用原 override 接管机制）
         override_state = {}   # veh_id -> {"steps": int, "act": str}
 
         # 回放记录器
@@ -441,7 +581,7 @@ def main():
 
         # ========== 主循环 ==========
         for step in range(50000):
-            ART_triggered = 0
+            ART_triggered = 0  # 复用为“发生过接管”标记
             world.wait_for_tick()
 
             if time.monotonic() - wall_start > EPISODE_MAX_SECONDS:
@@ -490,11 +630,9 @@ def main():
                 for vid in dead_ids:
                     override_state.pop(vid, None)
 
-                # 环境统计（若碰撞，立即早退）
+                # 环境统计
                 signals_list, ego_collision, all_collision, cross_solid_line, red_light = demo.tick()
-                if ego_collision or all_collision:
-                    print("[EARLY-EXIT] collision detected. Ending episode immediately.")
-                    break
+                collided_now = bool(ego_collision or all_collision)
 
                 # 非阻塞录像
                 if RECORDING and image_queue is not None:
@@ -546,16 +684,17 @@ def main():
                 # 记录一帧
                 rec.log(demo.ego_vehicle, demo.vehicles)
 
-                # === ART：自适应策略 + 触发 + 动作 ===
-                if (step % 3) == 0:  # 轻微加频率（sb_art 内部也会按策略 stride 控）
-                    policy, stats = update_adaptive_policy(world_map, demo.ego_vehicle, demo.vehicles)
-                    trigger_vehicles = filter_triggerables(demo.ego_vehicle, demo.vehicles, art, policy)
-                    # 只对前 max_considered 个触发
-                    trigger_vehicles = trigger_vehicles[:int(policy.get('max_considered', 3))]
-                    if trigger_vehicles:
-                        ART_triggered = 1
-                        actions, _ = build_actions_for(art, demo.ego_vehicle, trigger_vehicles, full_vehicle_list=trigger_vehicles)
-                        for v, act_name in zip(trigger_vehicles, actions):
+                # === DQN：先用上一步 (s,a) 生成 (s',r,done) 并训练；再选新的动作接管 ===
+                rl_ctrl.post_tick_update(demo.ego_vehicle, demo.vehicles, collided=collided_now)
+                if collided_now:
+                    print("[EARLY-EXIT] collision detected. Ending episode immediately.")
+                    break
+
+                if (step % 3) == 0:  # 频率保持与原 ART 一致
+                    selected = rl_ctrl.select_and_record(demo.ego_vehicle, demo.vehicles)
+                    if selected:
+                        ART_triggered = 1  # 复用这个字段做“发生过接管”的统计
+                        for v, act_name in selected:
                             ctrl = controller_by_actor_id.get(v.id)
                             if ctrl is None:
                                 continue
@@ -597,7 +736,6 @@ def main():
             timeout_total += timeout_cnt
             red_light_total += demo.ego_run_red_light
             cross_solid_line_total += demo.ego_cross_solid_line
-
 
             # 记录（含是否发生车辆侧碰）
             jsonable_conf = _to_jsonable(scenario_conf)
@@ -662,8 +800,11 @@ def main():
                 print(f"Generation {current_generation} end")
                 current_generation += 1
 
-
-
+            # —— 每回合末保存一次 DQN（可选） ——
+            try:
+                dqn.save("dqn.pt")
+            except Exception:
+                pass
 
             number_game += 1
         else:
