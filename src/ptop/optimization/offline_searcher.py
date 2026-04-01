@@ -1,4 +1,4 @@
-# offline_searcher.py —— 替换 CombinedGA 为此版本
+# offline_searcher.py — Replace CombinedGA with this version
 import random
 import math
 import numpy as np
@@ -8,7 +8,7 @@ def _distance(loc1, loc2):
     return math.sqrt((loc1.x - loc2.x)**2 + (loc1.y - loc2.y)**2)
 
 def _sanitize_position_info(pi: dict) -> dict:
-    # 兼容旧字段：surrounding_transforms -> surrounding_info
+    # Backward compatibility: surrounding_transforms -> surrounding_info
     if 'surrounding_transforms' in pi and 'surrounding_info' not in pi:
         pi['surrounding_info'] = [{'transform': t, 'type': 'car'} for t in pi['surrounding_transforms']]
         pi.pop('surrounding_transforms', None)
@@ -52,7 +52,7 @@ class CombinedGA:
         self.seq_len = seq_len
         self.enable_action_ga = enable_action_ga
 
-        self.population = []  # 每个元素: {"position_info": {...}, ["action_info": ...]}
+        self.population = []  # Each element: {"position_info": {...}, ["action_info": ...]}
         self.best_individual = None
         self.best_fitness = float('-inf')
 
@@ -66,7 +66,7 @@ class CombinedGA:
 
     def crossover_individuals(self, parent1, parent2, crossover_rate=0.8):
         if random.random() >= crossover_rate:
-            # 防守式清理一下两个父代的字段
+            # Defensively sanitize both parents' fields
             return (
                 {"position_info": _sanitize_position_info(parent1["position_info"])},
                 {"position_info": _sanitize_position_info(parent2["position_info"])}
@@ -78,7 +78,7 @@ class CombinedGA:
         child1 = {'position_info': {}}
         child2 = {'position_info': {}}
 
-        # 交换“邻车集”和 ego 位姿
+        # Swap surrounding vehicle sets and ego poses
         child1['position_info']['surrounding_info'] = p2['surrounding_info']
         child1['position_info']['vehicle_num'] = len(p2['surrounding_info'])
         child1['position_info']['ego_transform'] = p1['ego_transform']
@@ -90,9 +90,9 @@ class CombinedGA:
         return child1, child2
 
     def mutation(self, individual, mutation_rate=0.2):
-        # individual 是一个个体 dict
+        # individual is a single individual dict
         if random.random() < mutation_rate:
-            # 采样 10 个候选，选和 safe_set 差异最大的
+            # Sample 10 candidates, select the one most different from safe_set
             candidates = []
             scores = []
             for _ in range(10):
@@ -104,7 +104,7 @@ class CombinedGA:
                 scores.append(dist)
             return candidates[int(np.argmax(scores))]
         else:
-            # 仍然返回字段已清理的个体
+            # Still return the individual with sanitized fields
             out = {"position_info": _sanitize_position_info(individual["position_info"])}
             return out
 

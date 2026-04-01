@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-KING baseline（随机初始场景 + 可微自行车模型滚动优化）：
-- 随机选 EGO + N 个 NPC 的初始 Transform（均来自 map.get_spawn_points）
-- 前 K_ATTACK 个 NPC（按与 EGO 的前向距离 |s| 最近）作为“对抗车”，其余 NPC 由 Traffic Manager 控制
-- 每 REPLAN_STRIDE tick：用可微 Kinematic Bicycle + 常速 EGO 预测，在短时域内优化对抗车控制序列 U=[a,delta]
-- 目标：最小化与 EGO 的软最小距离（soft-min），并加控制幅度/平滑正则；仅执行第一步（MPC）
+“””
+KING baseline (random initial scenario + differentiable bicycle model receding-horizon optimization):
+- Randomly select initial Transforms for EGO + N NPCs (all from map.get_spawn_points)
+- The top K_ATTACK NPCs (ranked by closest longitudinal distance |s| to EGO) serve as adversarial vehicles; the rest are controlled by Traffic Manager
+- Every REPLAN_STRIDE ticks: use a differentiable Kinematic Bicycle model + constant-velocity EGO prediction to optimize the adversarial vehicle control sequence U=[a,delta] over a short horizon
+- Objective: minimize the soft-min distance to EGO, plus control magnitude/smoothness regularization; only execute the first step (MPC)
 
-依赖你现有的：
-  - world.MultiVehicleDemo（已支持 setup_vehicles_with_collision / 碰撞统计/闯红灯/压实线等）
-  - utility.purge_npcs（回合末清场）
-  - utility.has_passed_destination（是否到达）
-"""
+Dependencies:
+  - world.MultiVehicleDemo (supports setup_vehicles_with_collision / collision stats / red-light / solid-line violations, etc.)
+  - utility.purge_npcs (cleanup at end of episode)
+  - utility.has_passed_destination (check whether destination is reached)
+“””
 
 import os
 import cv2
@@ -27,7 +27,7 @@ import torch
 import torch.nn as nn
 import carla
 
-# ---- 可选依赖：若没有对应函数则提供空实现 ----
+# ---- Optional dependencies: provide empty implementations if not available ----
 try:
     from ptop.utils.utility import has_passed_destination, apollo_clear_prediction_planning, purge_npcs
 except Exception:
@@ -37,44 +37,44 @@ except Exception:
 
 from ptop.core.world import MultiVehicleDemo
 
-# ====================== 全局超参数 ======================
+# ====================== Global Hyperparameters ======================
 TIME_STEP = 0.05
 STARTUP_STEPS = 500
 
 # —— Traffic Manager —— #
 TM_PORT = 8000
-KEEP_ALIVE_PERIOD = 30  # TM 续权周期（tick）
+KEEP_ALIVE_PERIOD = 30  # TM keep-alive period (ticks)
 
-# —— 录像 —— #
+# —— Recording —— #
 RECORDING = False
 
-# —— 早退/兜底 —— #
+# —— Early exit / fallback —— #
 EPISODE_MAX_SECONDS = 180.0
 NO_PROGRESS_SECONDS = 15
 PROGRESS_THRESH = 2.0
 
-# —— 随机场景 —— #
-NPC_NUM = 20      # 每回合 NPC 总数
-MIN_NPC = 20      # 生成失败过多时跳回合
-K_ATTACK = 3      # 参与对抗优化的 NPC 数
+# —— Random scenario —— #
+NPC_NUM = 20      # Total NPCs per episode
+MIN_NPC = 20      # Skip episode if too few NPCs spawned
+K_ATTACK = 3      # Number of NPCs participating in adversarial optimization
 
-# —— KING 规划器参数 —— #
-REPLAN_STRIDE = 5     # 每多少 tick 重新规划一次
-H = 25                # 规划地平线步数
-DT_PLAN = 0.10        # 规划步长（可与 CARLA tick 不同）
-N_OPT = 30            # 每次滚动优化迭代轮数
-LR = 5e-2             # Adam 学习率
-TAU_SOFTMIN = 1.0     # 软最小距离温度
+# —— KING planner parameters —— #
+REPLAN_STRIDE = 5     # Replan every N ticks
+H = 25                # Planning horizon steps
+DT_PLAN = 0.10        # Planning time step (can differ from CARLA tick)
+N_OPT = 30            # Optimization iterations per replan
+LR = 5e-2             # Adam learning rate
+TAU_SOFTMIN = 1.0     # Soft-min distance temperature
 ACC_LIMIT = 3.0       # m/s^2
-STEER_LIMIT = 0.6     # rad (~34°)
-W_U = 1e-3            # 控制幅度正则
-W_DU = 5e-3           # 控制平滑正则
-V_MIN, V_MAX = 0.0, 25.0  # 速度上下限
+STEER_LIMIT = 0.6     # rad (~34 deg)
+W_U = 1e-3            # Control magnitude regularization
+W_DU = 5e-3           # Control smoothness regularization
+V_MIN, V_MAX = 0.0, 25.0  # Speed lower/upper bounds
 
-# —— 实验轮数 —— #
+# —— Test budget —— #
 TEST_BUDGET = 400
 
-# ====================== 几何/辅助 ======================
+# ====================== Geometry / Utilities ======================
 def _yaw_to_unit(yaw_deg: float):
     r = math.radians(yaw_deg)
     return math.cos(r), math.sin(r)
@@ -101,11 +101,11 @@ def constant_velocity_rollout(x0_np, H, dt):
         x = x.clone()
         x[0] = x[0] + x[3]*torch.cos(x[2]) * dt
         x[1] = x[1] + x[3]*torch.sin(x[2]) * dt
-        # yaw, v 恒定
+        # yaw, v remain constant
         xs.append(x[None, :])
     return torch.cat(xs, dim=0)  # [H+1, 4]
 
-# ====================== 可微 Kinematic Bicycle ======================
+# ====================== Differentiable Kinematic Bicycle ======================
 class KinematicBicycle(nn.Module):
     def __init__(self, L=2.7):
         super().__init__()
@@ -142,7 +142,7 @@ def control_regularizer(U):
     loss_du = (dU**2).mean()
     return W_U*loss_u + W_DU*loss_du
 
-# ====================== KING 规划器 ======================
+# ====================== KING Planner ======================
 class KingPlanner:
     def __init__(self, horizon=H, dt=DT_PLAN, n_opt=N_OPT, lr=LR, device="cpu"):
         self.horizon = horizon
@@ -190,17 +190,17 @@ def apply_king_control(actor: carla.Vehicle, a: float, delta: float):
     ctrl = carla.VehicleControl(throttle=throttle, brake=brake, steer=steer_cmd)
     actor.apply_control(ctrl)
 
-# ====================== 随机场景生成 ======================
+# ====================== Random Scenario Generation ======================
 def random_scenario(world_map: carla.Map, npc_num=NPC_NUM):
     sps = list(world_map.get_spawn_points())
     random.shuffle(sps)
     if len(sps) < npc_num + 1:
-        raise RuntimeError(f"spawn_points 不足：需要 {npc_num+1}，仅有 {len(sps)}")
+        raise RuntimeError(f"Insufficient spawn_points: need {npc_num+1}, only {len(sps)} available")
     ego_tf = sps[0]
     surrounding = [{"transform": sps[i+1], "type": "car"} for i in range(npc_num)]
     return {"vehicle_num": npc_num, "ego_transform": ego_tf, "surrounding_info": surrounding}
 
-# ====================== JSON 工具（记录场景） ======================
+# ====================== JSON Utilities (scenario logging) ======================
 def _to_jsonable(x):
     try:
         import carla as _carla
@@ -227,7 +227,7 @@ def append_jsonl(path: str, obj: dict):
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
-# ====================== 主程序 ======================
+# ====================== Main Program ======================
 def main():
     client = carla.Client("localhost", 2000)
     client.set_timeout(10.0)
@@ -235,7 +235,7 @@ def main():
     world_map = world.get_map()
     COLLIDED_JSONL = "king_random_scenarios.jsonl"
 
-    # 交通灯置绿（可选）
+    # Set all traffic lights to green (optional)
     for actor in world.get_actors():
         if isinstance(actor, carla.TrafficLight):
             actor.set_state(carla.TrafficLightState.Green)
@@ -263,23 +263,23 @@ def main():
     while number_game <= TEST_BUDGET:
         abnormal_case = False
 
-        # === 随机场景 ===
+        # === Random scenario ===
         scenario_conf = random_scenario(world_map, npc_num=NPC_NUM)
 
-        # === 生成与碰撞传感器 ===
+        # === Spawn vehicles and collision sensors ===
         success = demo.setup_vehicles_with_collision(scenario_conf)
         if not success:
-            print("[ERROR] 车辆生成失败，跳过回合。")
+            print("[ERROR] Vehicle spawn failed, skipping episode.")
             continue
 
         actual_n = len(demo.vehicles)
         demo.vehicle_num = actual_n
         if actual_n < MIN_NPC:
-            print(f"[WARN] only {actual_n} NPC spawned (<{MIN_NPC}), 跳回合。")
+            print(f"[WARN] only {actual_n} NPC spawned (<{MIN_NPC}), skipping episode.")
             demo.destroy_all()
             continue
 
-        # === TM 挂到非对抗车上 ===
+        # === Attach TM to non-adversarial vehicles ===
         ego_id = demo.ego_vehicle.id if demo.ego_vehicle is not None else -1
         for v in demo.vehicles:
             if v.id != ego_id:
@@ -290,7 +290,7 @@ def main():
                 tm.ignore_walkers_percentage(v, 0)
                 tm.distance_to_leading_vehicle(v, 2.5)
 
-        # === 录像 ===
+        # === Recording ===
         if RECORDING:
             camera_bp = world.get_blueprint_library().find('sensor.camera.rgb')
             camera_bp.set_attribute('image_size_x', '1280')
@@ -316,7 +316,7 @@ def main():
             camera = None
             image_queue = None
 
-        # === 选择对抗车（按前向距离 |s| 最小） ===
+        # === Select adversarial vehicles (by smallest longitudinal distance |s|) ===
         ego_tf0 = demo.ego_vehicle.get_transform()
         scored = []
         for v in demo.vehicles:
@@ -326,22 +326,22 @@ def main():
         scored.sort(key=lambda x: x[0])
         attack_list = [v for _, v in scored[:min(K_ATTACK, len(scored))]]
 
-        # 对抗车退出 TM
+        # Remove adversarial vehicles from TM
         for v in attack_list:
             v.set_autopilot(False)
 
-        # === 回合状态 ===
+        # === Episode state ===
         wall_start = time.monotonic()
         progress_anchor_loc = None
         progress_anchor_t = wall_start
         timeout_cnt = 0
         start_loc = None
 
-        # === 启动各模块（若使用 Apollo） ===
+        # === Start modules (if using Apollo) ===
         for mod in demo.modules:
             demo.enable_module(mod)
 
-        # ========== 主循环 ==========
+        # ========== Main loop ==========
         for step in range(100000):
             world.wait_for_tick()
 
@@ -349,12 +349,12 @@ def main():
                 print(f"[EARLY-EXIT] wall-clock > {EPISODE_MAX_SECONDS}s")
                 break
 
-            # 启动阶段
+            # Startup phase
             if step < STARTUP_STEPS:
                 ego_vel = demo.ego_vehicle.get_velocity()
                 speed_ego = math.sqrt(ego_vel.x**2 + ego_vel.y**2 + ego_vel.z**2)
                 if speed_ego > 5:
-                    print('[WARN] 启动阶段 EGO 速度异常，结束该轮。')
+                    print('[WARN] Abnormal EGO speed during startup phase, ending this episode.')
                     abnormal_case = True
             if step == STARTUP_STEPS and demo.external_ads:
                 start_loc = demo.ego_vehicle.get_location()
@@ -363,20 +363,20 @@ def main():
                 demo.set_destination()
 
             if step > STARTUP_STEPS:
-                # TM 续权（非对抗车）
+                # TM keep-alive (non-adversarial vehicles)
                 if step % KEEP_ALIVE_PERIOD == 0:
                     for v in demo.vehicles:
                         if v.id == ego_id or v in attack_list:
                             continue
                         v.set_autopilot(True, tm.get_port())
 
-                # tick & 早退
+                # tick & early exit
                 signals_list, ego_collision, all_collision, cross_solid_line, red_light = demo.tick()
                 if ego_collision or all_collision:
-                    print("[EARLY-EXIT] 碰撞，结束回合。")
+                    print("[EARLY-EXIT] Collision detected, ending episode.")
                     break
 
-                # 录像帧
+                # Recording frame
                 if RECORDING and image_queue is not None:
                     try:
                         frame = image_queue.get_nowait()
@@ -386,7 +386,7 @@ def main():
                     except Exception:
                         pass
 
-                # 无进展兜底
+                # No-progress fallback
                 ego_loc = demo.ego_vehicle.get_location()
                 if progress_anchor_loc is not None:
                     moved = math.hypot(ego_loc.x - progress_anchor_loc.x, ego_loc.y - progress_anchor_loc.y)
@@ -398,7 +398,7 @@ def main():
                         timeout_cnt = 1
                         break
 
-                # 摄像机跟随
+                # Camera follow
                 spectator = world.get_spectator()
                 trans = demo.ego_vehicle.get_transform()
                 loc = trans.location
@@ -413,7 +413,7 @@ def main():
                     carla.Rotation(pitch=-20, yaw=yaw_deg)
                 ))
 
-                # 到达检测（若用 Apollo 路由）
+                # Arrival detection (if using Apollo routing)
                 if demo.ego_destination is not None:
                     near_dest, pass_dest = has_passed_destination(demo.ego_vehicle, demo.ego_destination, world_map)
                     if step != 0 and demo.external_ads and near_dest:
@@ -423,7 +423,7 @@ def main():
                         for mod in demo.modules: demo.enable_module(mod)
                         print('pass destination error'); abnormal_case = True
 
-                # === KING：每 REPLAN_STRIDE tick 规划一次 ===
+                # === KING: replan every REPLAN_STRIDE ticks ===
                 if (step % REPLAN_STRIDE) == 0 and attack_list:
                     ego_x0 = to_state(demo.ego_vehicle)
                     for v in attack_list:
@@ -431,16 +431,16 @@ def main():
                             a, delta = planner.plan_once(ego_x0, to_state(v), v.id)
                             apply_king_control(v, a, delta)
                         except Exception as e:
-                            print(f"[WARN] 规划异常 veh {v.id}: {e}")
+                            print(f"[WARN] Planning error for veh {v.id}: {e}")
                             v.set_autopilot(True, tm.get_port())
 
-        # episode 尾：Apollo 清缓存（可选）
+        # End of episode: clear Apollo cache (optional)
         try:
             apollo_clear_prediction_planning(times=3, interval=0.05)
         except Exception:
             pass
 
-        # 额外 tick 稳定一下
+        # Extra ticks for stabilization
         for _ in range(60):
             world.wait_for_tick()
 
@@ -450,7 +450,7 @@ def main():
             except Exception:
                 pass
 
-        # 结束检查
+        # End-of-episode check
         end_loc = demo.ego_vehicle.get_location()
         if start_loc is not None:
             distance_to_start = math.dist([start_loc.x, start_loc.y], [end_loc.x, end_loc.y])
@@ -458,10 +458,10 @@ def main():
             distance_to_start = 0.0
         print('Moved distance: ', distance_to_start)
         if distance_to_start < 1:
-            print("[WARNING] EGO 起点与终点距离 < 1m，判定异常，不计入统计。")
+            print("[WARNING] EGO start-to-end distance < 1m, deemed abnormal, excluded from statistics.")
             abnormal_case = True
 
-        # 统计 & 记录
+        # Statistics & logging
         if not abnormal_case:
             side_total += demo.side_collision_count_vehicle
             obj_collision_total += demo.collision_count_obj
@@ -469,7 +469,7 @@ def main():
             red_light_total += int(demo.ego_run_red_light)
             cross_solid_total += int(demo.ego_cross_solid_line)
 
-            # 记录场景（含指标）
+            # Log scenario (with metrics)
             jsonable_conf = _to_jsonable(scenario_conf)
             record = {
                 "ts": datetime.now().isoformat(),
@@ -484,7 +484,7 @@ def main():
             append_jsonl(COLLIDED_JSONL, record)
             print(f"[SAVED] scenario appended to {COLLIDED_JSONL}")
 
-            # 若无碰撞且录制目录存在，可删除
+            # If no collision and recording directory exists, delete it
             if demo.side_collision_count_vehicle == 0 and RECORDING and os.path.isdir(save_dir):
                 try:
                     import shutil; shutil.rmtree(save_dir)
@@ -493,22 +493,22 @@ def main():
 
             number_game += 1
         else:
-            # 异常回合清理录像
+            # Clean up recording for abnormal episode
             if RECORDING and os.path.isdir(save_dir):
                 try:
                     import shutil; shutil.rmtree(save_dir)
                 except Exception:
                     pass
-            print(f"[INFO] 本轮异常，已跳过统计。")
+            print(f"[INFO] This episode was abnormal, statistics skipped.")
 
-        # 清场
+        # Cleanup
         demo.destroy_all()
         keep_ids = {demo.ego_vehicle.id} if demo.ego_vehicle else set()
         rem_veh, rem_walk = purge_npcs(world, client, tm=tm, keep_actor_ids=keep_ids,
                                        include_walkers=True, hard_teleport=True)
         print(f"[PURGE] left vehicles={rem_veh}, walkers={rem_walk}")
 
-    # ---- 汇总 ----
+    # ---- Summary ----
     print('=== KING baseline summary ===')
     print('Side collision (ego×vehicle):', side_total)
     print('Ego object collision:', obj_collision_total)

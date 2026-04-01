@@ -9,11 +9,11 @@ Runtime NPC SVGD (with rule-based minimum separation after each step).
   1) list of dict: [{"transform": carla.Transform, "type": "car"/"bicycle"/"pedestrian"}, ...]
   2) dict of parallel lists: {"transform": [carla.Transform, ...], "type": ["car", ...]}
 
-- Surrogate interface expected (任一签名均可被兼容):
+- Surrogate interface expected (any of the following signatures are compatible):
     A) score_and_grad(map, ego_tf, npc_tf, x_vec, eps=None) -> (float, (dF/ds, dF/dd, dF/dyaw))
     B) score_and_grad(map, ego_tf, npc_tf, x_vec)          -> (float, grad)
     C) score_and_grad(map, ego_tf, npc_tf)                 -> (float, grad)
-  其中 (ds,dd,dyaw) 是相对 EGO 的局部变量。若以上都不匹配，自动数值差分估计梯度。
+  where (ds,dd,dyaw) are local variables relative to EGO. If none of the above match, gradients are estimated via numerical finite differences.
 
 - Adds a rule-based guard `_enforce_min_separation` that keeps particles
   at least `min_sep` apart in (ds, dd) after EVERY SVGD step (and at the end).
@@ -291,20 +291,20 @@ class RuntimeNPCSVGD:
                 tf_k = _apply_local_offset(ego_tf, ds_k, dd_k, dy_k)
                 x_vec = (ds_k, dd_k, dy_k)
 
-                # ---- 兼容多种 score_and_grad 签名；失败时数值差分兜底 ----
+                # ---- Compatible with multiple score_and_grad signatures; falls back to numerical finite differences on failure ----
                 try:
-                    # A) 带 x_vec 和 eps
+                    # A) with x_vec and eps
                     Fk, gradk = self.surrogate.score_and_grad(self.map, ego_tf, tf_k, x_vec, eps=self.grad_eps)
                 except TypeError:
                     try:
-                        # B) 带 x_vec 不带 eps
+                        # B) with x_vec but without eps
                         Fk, gradk = self.surrogate.score_and_grad(self.map, ego_tf, tf_k, x_vec)
                     except TypeError:
                         try:
-                            # C) 仅 (map, ego_tf, npc_tf)
+                            # C) only (map, ego_tf, npc_tf)
                             Fk, gradk = self.surrogate.score_and_grad(self.map, ego_tf, tf_k)
                         except Exception:
-                            # D) 彻底兜底：数值中心差分
+                            # D) Ultimate fallback: numerical central differences
                             Fk = float(self.surrogate.score(self.map, ego_tf, tf_k))
                             fd = self.grad_eps or 0.25
 
@@ -317,7 +317,7 @@ class RuntimeNPCSVGD:
                             g_y = (sc(ds_k, dd_k, dy_k + fd) - sc(ds_k, dd_k, dy_k - fd)) / (2 * fd)
                             gradk = (g_s, g_d, g_y)
                 except Exception:
-                    # 其它异常也做数值差分兜底，防止 G=0 退化
+                    # Fall back to numerical finite differences for other exceptions to prevent G=0 degeneracy
                     Fk = float(self.surrogate.score(self.map, ego_tf, tf_k))
                     fd = self.grad_eps or 0.25
 

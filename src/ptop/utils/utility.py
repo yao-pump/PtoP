@@ -20,8 +20,8 @@ def purge_npcs(world: carla.World,
                include_walkers: bool = True,
                hard_teleport: bool = True) -> Tuple[int, int]:
     """
-    清空地图内所有 NPC（车辆/行人），保留 keep_actor_ids 指定的 Actor（例如 EGO）。
-    返回: (剩余车辆数, 剩余行人数) —— 不含 keep_actor_ids 中的 Actor。
+    Remove all NPCs (vehicles/pedestrians) from the map, keeping Actors specified by keep_actor_ids (e.g., EGO).
+    Returns: (remaining vehicle count, remaining pedestrian count) -- excluding Actors in keep_actor_ids.
     """
     keep: Set[int] = set(keep_actor_ids or [])
 
@@ -56,7 +56,7 @@ def purge_npcs(world: carla.World,
         walkers = []
         controllers = []
 
-    # 车辆脱管 & 刹停
+    # Disable autopilot & brake vehicles
     for v in vehs:
         try:
             if hasattr(v, "set_autopilot"):
@@ -66,7 +66,7 @@ def purge_npcs(world: carla.World,
             pass
     _flush(0.03, 2)
 
-    # 行人控制器先停
+    # Stop pedestrian controllers first
     for c in controllers:
         try:
             c.stop()
@@ -74,7 +74,7 @@ def purge_npcs(world: carla.World,
             pass
     _flush(0.02, 2)
 
-    # 必要时下沉，避免嵌套刚体销毁失败
+    # Teleport downward if needed to avoid nested rigid body destruction failure
     if hard_teleport:
         for a in vehs:
             try:
@@ -92,7 +92,7 @@ def purge_npcs(world: carla.World,
                 pass
         _flush(0.03, 2)
 
-    # 批量销毁：控制器 -> 行人 -> 车辆
+    # Batch destroy: controllers -> pedestrians -> vehicles
     def _batch_destroy(ids):
         if not ids:
             return []
@@ -107,7 +107,7 @@ def purge_npcs(world: carla.World,
     leftovers += _batch_destroy([v.id for v in vehs])
     _flush(0.03, 2)
 
-    # 单体兜底
+    # Individual fallback destruction
     for aid in list(leftovers):
         try:
             a = world.get_actor(aid)
@@ -117,7 +117,7 @@ def purge_npcs(world: carla.World,
             pass
     _flush(0.03, 2)
 
-    # 汇总剩余
+    # Summarize remaining actors
     actors2 = world.get_actors()
     rem_veh = sum(1 for a in actors2 if a.type_id.startswith('vehicle.') and a.id not in keep)
     rem_walk = sum(1 for a in actors2 if a.type_id.startswith('walker.pedestrian') and a.id not in keep)
@@ -125,7 +125,7 @@ def purge_npcs(world: carla.World,
 
 
 
-APOLLO_CLEAR_URL = "http://127.0.0.1:9002/clear"  # 若容器不在 host 网络，改成对应 IP:PORT
+APOLLO_CLEAR_URL = "http://127.0.0.1:9002/clear"  # If the container is not on the host network, change to the corresponding IP:PORT
 
 def apollo_clear_prediction_planning(times=1, interval=0.0, timeout=2.0, verbose=True):
     url = APOLLO_CLEAR_URL
@@ -150,20 +150,20 @@ def run_all_actions_for_npcs(
     all_action_sequences: Sequence[List[str]],
     action_trans: Callable[[Any, str], None],
     *,
-    delay_s: float = 0.0,    # 每个动作之间可选等待（或用同步仿真的 world.tick() 代替）
+    delay_s: float = 0.0,    # optional wait between each action (or use synchronous simulation's world.tick() instead)
 ) -> None:
     if len(vehicle_list) != len(all_action_sequences):
-        raise ValueError("vehicle_list 与 all_action_sequences 长度不一致，无法一一对应。")
+        raise ValueError("vehicle_list and all_action_sequences have different lengths, cannot match one-to-one.")
 
     for veh, seq in zip(vehicle_list, all_action_sequences):
-        # 对于“当前这辆车”，把它的 action sequence 全部执行完
+        # For “the current vehicle”, execute its entire action sequence
         for action in seq:
-            action_trans(veh, action)   # 第一个参数是车辆，第二个是动作（字符串）
+            action_trans(veh, action)   # first argument is the vehicle, second is the action (string)
             if delay_s > 0:
                 time.sleep(delay_s)
 def action_trans(vehicle, action):
     """
-    根据动作名称对车辆执行相应操作的示例函数。
+    Example function that executes the corresponding operation on a vehicle based on the action name.
     """
     if action == 'break':
         vehicle.decelerate()
@@ -180,16 +180,16 @@ def action_trans(vehicle, action):
 
 
 def map_size(world):
-    # 加载.xodr文件
+    # Load .xodr file
     xodr_path = "Town01.xodr"
     tree = ET.parse(xodr_path)
     root = tree.getroot()
 
-    # 初始化范围
+    # Initialize bounds
     min_x, max_x = float('inf'), float('-inf')
     min_y, max_y = float('inf'), float('-inf')
 
-    # 遍历几何信息
+    # Iterate over geometry information
     for road in root.findall('road'):
         for geometry in road.find('planView').findall('geometry'):
             x = float(geometry.get('x'))
@@ -262,18 +262,18 @@ def position_scaler(position, x_min, x_max, y_min, y_max):
 
 def state_encoder(ego_vehicle, vehicles, ego_vehicle_position, agent_positions, max_x_diff, max_y_diff):
     state = []
-    # 计算所有车辆的速度，避免重复调用
+    # Compute speeds of all vehicles to avoid redundant calls
     vehicle_speeds = [get_xy_speed(vehicle) for vehicle in vehicles]
     ego_vel_x, ego_vel_y = get_xy_speed(ego_vehicle)
 
     for i, agent_position in enumerate(agent_positions):
         vel_x, vel_y = vehicle_speeds[i]
 
-        # 计算其他代理的位置和速度
+        # Compute positions and velocities of other agents
         other_agents = [pos for j, pos in enumerate(agent_positions) if j != i]
         other_vels = [vehicle_speeds[j] for j in range(len(vehicles)) if j != i]
 
-        # 确保至少有两个代理（否则填充默认值）
+        # Ensure at least two agents (otherwise pad with default values)
         while len(other_agents) < 2:
             other_agents.append((0, 0))
             other_vels.append((0, 0))
@@ -309,46 +309,46 @@ def has_passed_destination(vehicle,
                           pass_ahead_m: float = 2.0,
                           require_same_lane: bool = True,
                           near_speed_mps: float = None):
-    """
-    near = 距目的地直线距离 <= near_dist_m
-           （可选 near_speed_mps 不为 None 时，还需速度 <= 该阈值）
-    passed = 以“目的地 waypoint 的路面切线”为参考，车辆落在目的地“前方” (s >= pass_ahead_m)
-             且横向偏移 |d| <= lat_band_m
-             （可选：要求与目的地同 road/lane）
-    """
+    “””
+    near = straight-line distance to destination <= near_dist_m
+           (optionally, if near_speed_mps is not None, also requires speed <= that threshold)
+    passed = using the “road tangent at the destination waypoint” as reference, the vehicle is “ahead” of the destination (s >= pass_ahead_m)
+             and lateral offset |d| <= lat_band_m
+             (optionally: requires same road/lane as destination)
+    “””
     import math
     import carla
 
-    # --- 车辆与目的地位置 ---
+    # --- Vehicle and destination positions ---
     veh_tf = vehicle.get_transform()
     veh_loc = veh_tf.location
     dx = veh_loc.x - destination_location.x
     dy = veh_loc.y - destination_location.y
     dist = math.hypot(dx, dy)
 
-    # near 判定
+    # near determination
     near = dist <= near_dist_m
     if near and near_speed_mps is not None:
         vel = vehicle.get_velocity()
         speed = math.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2)
         near = near and (speed <= near_speed_mps)
 
-    # --- 用“目的地处的道路切线/法线”来做投影 ---
+    # --- Project using the “road tangent/normal at the destination” ---
     wp_dest = world_map.get_waypoint(destination_location,
                                      project_to_road=True,
                                      lane_type=carla.LaneType.Driving)
     if wp_dest is None:
-        # 退化：没有拿到目的地 waypoint，就只能给 near，passed 置 False
+        # Fallback: could not get destination waypoint, can only return near, set passed to False
         return near, False
 
     T = wp_dest.transform
-    t_hat = T.get_forward_vector()   # 路面切线（单位向量）
-    n_hat = T.get_right_vector()     # 路面法线（单位向量）
+    t_hat = T.get_forward_vector()   # road tangent (unit vector)
+    n_hat = T.get_right_vector()     # road normal (unit vector)
     r = carla.Vector3D(veh_loc.x - T.location.x,
                        veh_loc.y - T.location.y,
                        (veh_loc.z - T.location.z) if hasattr(veh_loc, "z") else 0.0)
 
-    # 沿程/横向投影
+    # Longitudinal / lateral projection
     s = r.x * t_hat.x + r.y * t_hat.y + r.z * t_hat.z
     d = r.x * n_hat.x + r.y * n_hat.y + r.z * n_hat.z
 
@@ -374,17 +374,17 @@ import math
 
 def _extract_xy_list(pop: dict):
     """
-    从 population 的 position_info（或直接是 position dict）里提取
-    [ (x,y), (x,y), ... ]，兼容 surrounding_info / surrounding_transforms 两种格式。
+    Extract [(x,y), (x,y), ...] from the population's position_info (or directly from a position dict),
+    compatible with both surrounding_info and surrounding_transforms formats.
     """
-    # pop 可能是 {"position_info": {...}} 或直接是 {...}
+    # pop may be {"position_info": {...}} or directly {...}
     pi = pop.get("position_info", pop)
 
-    # 取 ego 坐标
+    # Get ego coordinates
     ego_tf = pi["ego_transform"]
     ego_xy = (ego_tf.location.x, ego_tf.location.y)
 
-    # 取 surrounding 坐标列表（兼容两种字段）
+    # Get surrounding coordinate list (compatible with both field names)
     if "surrounding_info" in pi:
         surr = pi["surrounding_info"]
         surr_xy = [(item["transform"].location.x, item["transform"].location.y) for item in surr]
@@ -394,7 +394,7 @@ def _extract_xy_list(pop: dict):
     else:
         surr_xy = []
 
-    # 车辆数（若没有 vehicle_num 字段，就用列表长度）
+    # Vehicle count (if vehicle_num field is absent, use list length)
     vnum = pi.get("vehicle_num", len(surr_xy))
 
     return ego_xy, surr_xy, vnum
@@ -403,20 +403,20 @@ def _euclid2(a, b):
     return math.hypot(a[0] - b[0], a[1] - b[1])
 
 def calculate_population_distance(pop1, pop2, alpha=1.0):
-    """
-    计算两个 population（或其 position_info）之间的“距离”：
-      - EGO 位置差
-      - surrounding 位置的平均差（按 zip 到最小公共个数）
-      - 车辆数量差（权重 alpha）
-    兼容 surrounding_info / surrounding_transforms。
-    """
+    “””
+    Compute the “distance” between two populations (or their position_info):
+      - EGO position difference
+      - Average surrounding position difference (zipped to the minimum common count)
+      - Vehicle count difference (weighted by alpha)
+    Compatible with surrounding_info / surrounding_transforms.
+    “””
     ego1, surr1, n1 = _extract_xy_list(pop1)
     ego2, surr2, n2 = _extract_xy_list(pop2)
 
-    # EGO 距离
+    # EGO distance
     ego_dist = _euclid2(ego1, ego2)
 
-    # surrounding 平均距离（按顺序 zip，若需要“顺序无关”，可改用匈牙利匹配）
+    # Surrounding average distance (zipped in order; if order-independent is needed, use Hungarian matching)
     m = min(len(surr1), len(surr2))
     if m > 0:
         surr_dists = [_euclid2(a, b) for a, b in zip(surr1[:m], surr2[:m])]
@@ -424,11 +424,11 @@ def calculate_population_distance(pop1, pop2, alpha=1.0):
     else:
         surr_mean = 0.0
 
-    # 车辆数量相对差
+    # Relative vehicle count difference
     denom = max(max(n1, n2), 1)
     vnum_term = alpha * (abs(n1 - n2) / denom)
 
-    # 最终距离：位置部分用 (ego + surrounding_mean) 的均值
+    # Final distance: position component uses the mean of (ego + surrounding_mean)
     pos_term = (ego_dist + surr_mean) / 2.0
     return pos_term + vnum_term
 
@@ -436,21 +436,21 @@ def calculate_population_distance(pop1, pop2, alpha=1.0):
 
 def average_population_distance(population, generation):
     """
-    计算一个 population 与整个 generation 之间的平均距离
+    Compute the average distance between a population and an entire generation.
     """
     distances = [calculate_population_distance(population["position_info"], pop["position_info"]) for pop in generation]
     return np.mean(distances)
 
 def min_population_distance(population, generation):
     """
-    计算一个 population 与整个 generation 之间的平均距离
+    Compute the minimum distance between a population and an entire generation.
     """
     distances = [calculate_population_distance(population["position_info"], pop["position_info"]) for pop in generation]
     return min(distances)
 
 def max_population_distance(population, generation):
     """
-    计算一个 population 与整个 generation 之间的平均距离
+    Compute the maximum distance between a population and an entire generation.
     """
     distances = [calculate_population_distance(population["position_info"], pop["position_info"]) for pop in generation]
     return min(distances)

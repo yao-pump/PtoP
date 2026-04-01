@@ -1,10 +1,10 @@
-# npc_surrogate_mlp.py — 增强版
-# 变更摘要：
-# 1) 引入 target_model（EMA 冻结）专供 SVGD 的 score/score_and_grad 使用；self.model 仍用于训练（与现有 train_mlp_all_pairs 兼容）。
-# 2) 提供 ema_update(tau) 与 freeze_target()，训练后做 EMA 同步，保证梯度稳定。
-# 3) score_and_grad 支持可选“logit 梯度”（use_logit_grad=True），增强极端概率区间的梯度信号（默认 False，避免过激）。
-# 4) 对地图派生特征做安全钳位（clamp），减少异常值导致的数值不稳。
-# 5) 所有推理路径均使用 target_model.eval() 且参数 requires_grad=False，确保仅对 (ds,dd,dyaw) 建图。
+# npc_surrogate_mlp.py — Enhanced version
+# Change summary:
+# 1) Introduced target_model (EMA-frozen) exclusively for SVGD's score/score_and_grad; self.model is still used for training (compatible with existing train_mlp_all_pairs).
+# 2) Provided ema_update(tau) and freeze_target() for EMA synchronization after training to ensure gradient stability.
+# 3) score_and_grad supports optional “logit gradient” (use_logit_grad=True) to enhance gradient signal in extreme probability regions (default False to avoid aggressive behavior).
+# 4) Applied safe clamping on map-derived features to reduce numerical instability caused by outliers.
+# 5) All inference paths use target_model.eval() with requires_grad=False for parameters, ensuring computation graph is built only w.r.t. (ds,dd,dyaw).
 
 import math
 import os
@@ -16,12 +16,12 @@ import torch
 import torch.nn as nn
 
 try:
-    import carla  # 运行期可用；若离线工具导入失败不影响
+    import carla  # Available at runtime; import failure in offline tools is acceptable
 except Exception:  # pragma: no cover
     carla = None
 
 
-# ============== 几何辅助，与主程序保持一致 ==============
+# ============== Geometry helpers, consistent with the main program ==============
 
 def _yaw_to_unit(yaw_deg: float):
     r = math.radians(yaw_deg)
@@ -85,7 +85,7 @@ def _curvature_approx(world_map, npc_tf, ds=2.0) -> float:
         return 0.0
 
 
-# ============== MLP 模型 ==============
+# ============== MLP Model ==============
 
 class _HazardMLP(nn.Module):
     def __init__(self, in_dim=8, hidden=64):
@@ -93,7 +93,7 @@ class _HazardMLP(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden), nn.ReLU(inplace=True),
             nn.Linear(hidden, hidden), nn.ReLU(inplace=True),
-            nn.Linear(hidden, 1), nn.Sigmoid(),  # 输出概率 [0,1]
+            nn.Linear(hidden, 1), nn.Sigmoid(),  # Output probability [0,1]
         )
 
     def forward(self, x):
@@ -102,31 +102,31 @@ class _HazardMLP(nn.Module):
 
 @dataclass
 class SurrogateOptions:
-    use_logit_grad: bool = False  # True: 使用 logit(p) 的梯度，增强边界区间的信号
-    clamp_lane_lat: float = 3.0   # 车道中心横向偏移的钳位（米）
-    clamp_curv: float = 0.5       # 曲率的钳位（1/m），过大通常是噪声
-    clamp_spd_norm: Tuple[float, float] = (0.0, 2.0)  # 速度归一化范围
+    use_logit_grad: bool = False  # True: use logit(p) gradient to enhance signal in boundary regions
+    clamp_lane_lat: float = 3.0   # Clamp for lane center lateral offset (meters)
+    clamp_curv: float = 0.5       # Clamp for curvature (1/m); excessively large values are usually noise
+    clamp_spd_norm: Tuple[float, float] = (0.0, 2.0)  # Speed normalization range
 
 
 class NPCHazardMLPSurrogate:
     """
-    输入特征（与 score_and_grad 一致）：
-      [ s/12, d/1.5, sin(Δyaw), cos(Δyaw), lane_lat, curv, is_junc, spd_norm ]
+    Input features (consistent with score_and_grad):
+      [ s/12, d/1.5, sin(delta_yaw), cos(delta_yaw), lane_lat, curv, is_junc, spd_norm ]
 
-    用法：
-      - 训练：操作 self.model（与旧版兼容）；
-      - 推理/求梯度：经由 self.target_model（EMA 冻结），接口 score / score_and_grad。
-      - 训练后调用 ema_update(tau) 同步至 target_model；或首次可调用 freeze_target() 直接拷贝。
+    Usage:
+      - Training: operate on self.model (backward compatible with older versions);
+      - Inference/gradient computation: via self.target_model (EMA-frozen), through the score / score_and_grad interface.
+      - After training, call ema_update(tau) to synchronize to target_model; or call freeze_target() for a direct copy on first use.
     """
 
     def __init__(self, device: Optional[str] = None, ckpt_path: str = "mlp_frozen.pt", opts: Optional[SurrogateOptions] = None):
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-        self.model = _HazardMLP().to(self.device)           # 训练用
-        self.target_model = _HazardMLP().to(self.device)    # 推理/梯度用（冻结）
+        self.model = _HazardMLP().to(self.device)           # For training
+        self.target_model = _HazardMLP().to(self.device)    # For inference/gradient (frozen)
         self.opts = opts or SurrogateOptions()
-        # 尝试加载到训练模型
+        # Attempt to load weights into the training model
         self._load_if_exists(ckpt_path)
-        # 初始化 target 为当前训练权重，并冻结
+        # Initialize target with current training weights and freeze
         self.freeze_target(copy_from_model=True)
 
     # --------- I/O ---------
@@ -151,10 +151,10 @@ class NPCHazardMLPSurrogate:
         except Exception as e:
             print(f"[SVGD-MLP] save error: {e}")
 
-    # --------- 目标网络（EMA 冻结）管理 ---------
+    # --------- Target network (EMA-frozen) management ---------
     @torch.no_grad()
     def ema_update(self, tau: float = 0.05):
-        """以 EMA 同步训练权重到 target_model： target = (1-tau)*target + tau*model."""
+        """EMA-sync training weights to target_model: target = (1-tau)*target + tau*model."""
         for p_t, p_s in zip(self.target_model.parameters(), self.model.parameters()):
             p_t.copy_(p_t * (1.0 - tau) + p_s * tau)
         self._freeze_(self.target_model)
@@ -171,7 +171,7 @@ class NPCHazardMLPSurrogate:
         for p in m.parameters():
             p.requires_grad_(False)
 
-    # --------- 核心 API：score，score_and_grad ---------
+    # --------- Core API: score, score_and_grad ---------
     @torch.no_grad()
     def score(self, world_map, ego_tf, npc_tf) -> float:
         feats = self._build_feats(world_map, ego_tf, npc_tf)
@@ -180,30 +180,30 @@ class NPCHazardMLPSurrogate:
         p = self.target_model(x).squeeze().item()
         return float(p)
 
-    def score_and_grad(self, world_map, ego_tf, npc_tf, x_vec, h=0.5):  # h 保留兼容，无实际使用
+    def score_and_grad(self, world_map, ego_tf, npc_tf, x_vec, h=0.5):  # h kept for compatibility, not actually used
         """
-        x_vec = [ds, dd, dyaw_deg]（米/米/度）
-        返回 (f, grad): f in [0,1]; grad 对 ds, dd, dyaw_deg 的偏导。
-        仅构建 w.r.t. x_vec 的计算图，target_model 参数冻结。
-        可选：use_logit_grad=True 时返回 logit 的梯度（做裁剪以防发散）。
+        x_vec = [ds, dd, dyaw_deg] (meters/meters/degrees)
+        Returns (f, grad): f in [0,1]; grad contains partial derivatives w.r.t. ds, dd, dyaw_deg.
+        Computation graph is built only w.r.t. x_vec; target_model parameters are frozen.
+        Optional: when use_logit_grad=True, returns logit gradient (clipped to prevent divergence).
         """
-        # 自变量（可导）
+        # Independent variables (differentiable)
         ds = torch.tensor(float(x_vec[0]), dtype=torch.float32, device=self.device, requires_grad=True)
         dd = torch.tensor(float(x_vec[1]), dtype=torch.float32, device=self.device, requires_grad=True)
         dy = torch.tensor(float(x_vec[2]), dtype=torch.float32, device=self.device, requires_grad=True)  # degree
 
-        # 基准（当前状态）
+        # Baseline (current state)
         s0, d0 = _ego_local_sd(ego_tf, npc_tf.location)
         base_rel_deg = _relative_yaw_deg(ego_tf, npc_tf)
 
-        # 将 (s,d,Δyaw) 的“增量”套到特征上（和 _build_feats 完全一致的缩放）
+        # Apply (s,d,delta_yaw) increments to features (same scaling as _build_feats)
         s = (torch.tensor(s0, device=self.device) + ds) / 12.0
         d = (torch.tensor(d0, device=self.device) + dd) / 1.5
         rel_rad = torch.tensor(math.radians(base_rel_deg), device=self.device) + dy * (math.pi / 180.0)
         sp = torch.sin(rel_rad)
         cp = torch.cos(rel_rad)
 
-        # 地图常量项（不进图）
+        # Map-derived constant terms (not included in computation graph)
         lane_lat = float(_lane_center_offset(world_map, npc_tf))
         lane_lat = float(max(-self.opts.clamp_lane_lat, min(self.opts.clamp_lane_lat, lane_lat)))
         curv = float(_curvature_approx(world_map, npc_tf, ds=2.0))
@@ -234,23 +234,23 @@ class NPCHazardMLPSurrogate:
             torch.tensor(spd_norm, dtype=torch.float32, device=self.device),
         ], dim=0).unsqueeze(0)  # [1,8]
 
-        # 模型前向（仅对 x_vec 求导，参数冻结）
+        # Model forward pass (gradient only w.r.t. x_vec; parameters frozen)
         self.target_model.eval()
         for p in self.target_model.parameters():
             p.requires_grad_(False)
         y = self.target_model(feats)  # [1,1] in [0,1]
-        p = y.squeeze()               # 标量 Tensor
+        p = y.squeeze()               # Scalar Tensor
 
-        # 选择梯度形态
+        # Choose gradient form
         if self.opts.use_logit_grad:
-            # logit(p) = log(p/(1-p))；∂logit/∂x = ∂p/∂x / (p*(1-p))
-            # 为稳健性，对分母做 ε 防护并裁剪整体梯度。
+            # logit(p) = log(p/(1-p)); d_logit/d_x = d_p/d_x / (p*(1-p))
+            # For robustness, apply epsilon guard on the denominator and clip overall gradient.
             logit = torch.log(torch.clamp(p, 1e-6, 1-1e-6)) - torch.log(torch.clamp(1-p, 1e-6, 1.0))
             obj = logit
         else:
             obj = p
 
-        # 反向到 (ds,dd,dy)
+        # Backpropagate to (ds, dd, dy)
         self.target_model.zero_grad(set_to_none=True)
         for t in (ds, dd, dy):
             if t.grad is not None:
@@ -261,12 +261,12 @@ class NPCHazardMLPSurrogate:
         g_dd = dd.grad.item() if dd.grad is not None else 0.0
         g_dy = dy.grad.item() if dy.grad is not None else 0.0
 
-        # 若用 logit，按 1/(p*(1-p)) 的增长趋势，做温和裁剪
+        # If using logit, apply gentle clipping to account for the 1/(p*(1-p)) growth trend
         g = np.array([g_ds, g_dd, g_dy], dtype=float)
         g = np.clip(g, -10.0, 10.0)
         return float(p.item()), g
 
-    # --------- 内部：构造与前向一致的特征 ---------
+    # --------- Internal: build features consistent with forward pass ---------
     def _build_feats(self, world_map, ego_tf, npc_tf):
         s0, d0 = _ego_local_sd(ego_tf, npc_tf.location)
         rel_deg = _relative_yaw_deg(ego_tf, npc_tf)

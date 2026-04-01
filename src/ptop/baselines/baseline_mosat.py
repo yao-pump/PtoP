@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-主程序（完整可运行骨架）：
-- GA 采样 + 代末 SVGD 微调（对 NPC 初始 (ds, dd, dyaw)）
-- 【已替换】MOSAT（模体驱动）在线操控 NPC（原子机动序列）
-- MLP surrogate：输入 = 起点特征，标签 = episode 内 NPC 与 EGO 最近距离时刻的 hazard（min-distance 方案）
-- 在线每回合 1-2 epoch 微调；可选 EMA（若 surrogate 提供 ema_update）
+Main program (complete runnable skeleton):
+- GA sampling + end-of-generation SVGD refinement (for NPC initial (ds, dd, dyaw))
+- [Replaced] MOSAT (motif-driven) online NPC control (atomic maneuver sequences)
+- MLP surrogate: input = spawn-point features, label = hazard at the min-distance moment between NPC and EGO within an episode (min-distance scheme)
+- Online fine-tuning 1-2 epochs per episode; optional EMA (if surrogate provides ema_update)
 """
 
 import os
@@ -31,40 +31,40 @@ from ptop.optimization.surrogate_mlp import NPCHazardMLPSurrogate
 from ptop.optimization.svgd_runtime import RuntimeNPCSVGD
 from ptop.agents.replay_buffer import NearMissReplay
 
-# ====================== 全局超参数 ======================
+# ====================== Global Hyperparameters ======================
 TIME_STEP = 0.05
-population_size = 10  # 每代 10 个有效回合
+population_size = 10  # 10 valid episodes per generation
 
 # —— Traffic Manager —— #
-KEEP_ALIVE_PERIOD = 30  # TM 续权周期（tick）
+KEEP_ALIVE_PERIOD = 30  # TM keep-alive period (ticks)
 
-# —— 录像 —— #
+# —— Recording —— #
 RECORDING = False
 
-# —— 早退/兜底 —— #
+# —— Early exit / fallback —— #
 EPISODE_MAX_SECONDS = 180.0
 NO_PROGRESS_SECONDS = 15
 PROGRESS_THRESH = 2.0
 STARTUP_STEPS = 500
 
-# —— SVGD 门控（代际末触发，不在回合内） —— #
+# —— SVGD gating (triggered at end of generation, not within episodes) —— #
 NEARMISS_SAVE_TAU = 0.5
 SVGD_TOP_CASES = 5
 SVGD_STEPS_PER_CASE = 8
-SVGD_EPS = 0.08         # 步长更小
-SVGD_BETA = 3           # 排斥更强
-SVGD_GRAD_EPS = 0.35    # 核更窄
+SVGD_EPS = 0.08         # Smaller step size
+SVGD_BETA = 3           # Stronger repulsion
+SVGD_GRAD_EPS = 0.35    # Narrower kernel
 
-# —— SVGD 搜索盒 —— #
+# —— SVGD search box —— #
 DS_LIM = 25.0
 DD_LIM = 4.5
 DYAW_LIM = 20.0
 MIN_SEP = 3.5
 
-# —— 生成数量最低门槛（实际生成太少直接回滚） —— #
+# —— Minimum spawn threshold (rollback if too few actually spawned) —— #
 MIN_NPC = 20
 
-# ====================== MOSAT 原子/模体定义（新增） ======================
+# ====================== MOSAT Atomic/Motif Definitions (newly added) ======================
 ATOMIC_ACTIONS = [
     "accelerate", "break",
     "left_change_acc", "left_change_dec",
@@ -72,7 +72,7 @@ ATOMIC_ACTIONS = [
 ]
 
 class AtomicGene:
-    """一个原子机动 + 持续时间（秒）"""
+    """An atomic maneuver + duration (seconds)"""
     def __init__(self, act: str, dur: float = 1.0):
         assert act in ATOMIC_ACTIONS
         self.act = act
@@ -80,8 +80,8 @@ class AtomicGene:
 
 class MotifGene:
     """
-    模体类型：ahead / side_front / behind / side_behind
-    基于 EGO 与 NPC 的相对构型生成一段原子机动序列
+    Motif type: ahead / side_front / behind / side_behind
+    Generates an atomic maneuver sequence based on the relative configuration of EGO and NPC.
     """
     def __init__(self, motif_type: str, dur: float = 4.0):
         assert motif_type in ["ahead", "side_front", "behind", "side_behind"]
@@ -89,7 +89,7 @@ class MotifGene:
         self.dur = float(dur)
 
     def plan(self, world_map, ego: carla.Actor, npc: carla.Actor):
-        """产出若干 AtomicGene 构成的序列"""
+        """Produce a sequence of AtomicGene instances"""
         ego_wp = world_map.get_waypoint(ego.get_location(), project_to_road=True)
         npc_wp = world_map.get_waypoint(npc.get_location(), project_to_road=True)
         same_lane = (ego_wp.road_id == npc_wp.road_id and ego_wp.lane_id == npc_wp.lane_id)
@@ -98,9 +98,9 @@ class MotifGene:
         nx, ny = npc.get_location().x, npc.get_location().y
         dx, dy = nx - ex, ny - ey
         cy, sy = _yaw_to_unit(ego.get_transform().rotation.yaw)
-        front = (dx*cy + dy*sy) > 0  # NPC 是否在 EGO 前方
+        front = (dx*cy + dy*sy) > 0  # Whether NPC is in front of EGO
 
-        # 每个模体给出 1~3 个原子机动，持续时间粗定为 1s/步
+        # Each motif produces 1~3 atomic maneuvers, with duration roughly set to 1s/step
         if self.motif_type == "ahead" and same_lane and front:
             return [AtomicGene(random.choice(["left_change_dec","right_change_dec","break"]))]
 
@@ -118,12 +118,12 @@ class MotifGene:
             return [AtomicGene("accelerate"),
                     AtomicGene(random.choice(["left_change_acc","right_change_acc"]))]
 
-        # 默认回退：轻微加/减速
+        # Default fallback: slight acceleration/deceleration
         return [AtomicGene(random.choice(["accelerate","break"]))]
 
 def _pick_motif_for_npc(world_map, ego: carla.Actor, npc: carla.Actor) -> MotifGene:
     """
-    基于相对构型选择一个模体类型
+    Select a motif type based on the relative configuration.
     """
     ego_wp = world_map.get_waypoint(ego.get_location(), project_to_road=True)
     npc_wp = world_map.get_waypoint(npc.get_location(), project_to_road=True)
@@ -143,8 +143,8 @@ def _pick_motif_for_npc(world_map, ego: carla.Actor, npc: carla.Actor) -> MotifG
 
 def mosat_plan_sequences(world_map, ego: carla.Actor, vehicles: list):
     """
-    为每个 NPC 生成一段序列：模体 -> 原子机动序列
-    返回: dict[vid] = [{"act": str, "steps": int}, ...]
+    Generate a sequence for each NPC: motif -> atomic maneuver sequence.
+    Returns: dict[vid] = [{"act": str, "steps": int}, ...]
     """
     seqs = {}
     for v in vehicles:
@@ -152,14 +152,14 @@ def mosat_plan_sequences(world_map, ego: carla.Actor, vehicles: list):
             continue
         motif = _pick_motif_for_npc(world_map, ego, v)
         atomic_seq = motif.plan(world_map, ego, v)
-        # 将持续时间换算成“仿真步数”
+        # Convert duration to simulation steps
         seqs[v.id] = [{"act": a.act, "steps": max(1, int(a.dur / TIME_STEP))} for a in atomic_seq]
     return seqs
 
-# ====================== 几何/辅助 ======================
+# ====================== Geometry / Utilities ======================
 def average_population_distance(population, generation):
     """
-    计算一个 population 与整个 generation 之间的平均距离
+    Compute the average distance between a population and the entire generation.
     """
     distances = [calculate_population_distance(population["position_info"], pop["position_info"]) for pop in generation]
     return np.mean(distances)
@@ -175,7 +175,7 @@ def ego_local_sd(ego_tf: carla.Transform, pt: carla.Location):
     d = -dx * sy + dy * cy
     return s, d
 
-# ====================== Episode 记录 ======================
+# ====================== Episode Recorder ======================
 class EpisodeRecorder:
     def __init__(self, world_map):
         self.map = world_map
@@ -196,7 +196,7 @@ class EpisodeRecorder:
             npcs[v.id] = {"tf": v.get_transform(), "vel": self._vel_of(v)}
         self.frames.append({"ego": {"tf": ego_tf, "vel": ego_vel}, "npcs": npcs})
 
-# ====================== min-distance hazard 标签 ======================
+# ====================== Min-distance Hazard Labels ======================
 
 def _closing_speed_at(ego_tf, ego_vel, npc_tf, npc_vel):
     rx = npc_tf.location.x - ego_tf.location.x
@@ -205,7 +205,7 @@ def _closing_speed_at(ego_tf, ego_vel, npc_tf, npc_vel):
     ux, uy = rx / rnorm, ry / rnorm
     vrelx = npc_vel[0] - ego_vel[0]
     vrely = npc_vel[1] - ego_vel[1]
-    v_close = -(vrelx * ux + vrely * uy)  # 正值=在靠近
+    v_close = -(vrelx * ux + vrely * uy)  # Positive = approaching
     return max(0.0, v_close)
 
 def find_min_distance_window(frames, npc_id, win=2):
@@ -234,7 +234,7 @@ def hazard_from_min_distance(frames, world_map, npc_id,
     if t_star < 0 or not idxs:
         return 0.0
 
-    # 碰撞近似：任一窗口帧距离 <1.5m 判 1
+    # Collision approximation: if any window frame has distance < 1.5m, return 1
     collided = False
     v_closes = []
     heads = []
@@ -270,7 +270,7 @@ def hazard_from_min_distance(frames, world_map, npc_id,
     y_i = 1.0 - prod
     return max(0.0, min(1.0, y_i))
 
-# ====================== 数据集与训练 ======================
+# ====================== Dataset and Training ======================
 
 def build_initial_pose_dataset_minDist(rec, world_map, surrogate_mlp,
                                        D0=6.0, v0=0.5, sigma_v=1.0,
@@ -354,7 +354,7 @@ def push_nearmiss_initial_to_replay(replay: NearMissReplay, dataset_tuple, min_t
             break
     return cnt
 
-# ====================== JSON 序列化工具 ======================
+# ====================== JSON Serialization Utilities ======================
 
 def _to_jsonable(x):
     try:
@@ -383,7 +383,7 @@ def append_jsonl(path: str, obj: dict):
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
-# ====================== 主程序 ======================
+# ====================== Main Program ======================
 
 def main():
     client = carla.Client("localhost", 2000)
@@ -391,7 +391,7 @@ def main():
     world = client.get_world()
     COLLIDED_JSONL = "collided_scenarios.jsonl"
 
-    # 交通灯全绿
+    # Set all traffic lights to green
     for actor in world.get_actors():
         if isinstance(actor, carla.TrafficLight):
             actor.set_state(carla.TrafficLightState.Green)
@@ -427,7 +427,7 @@ def main():
 
     while number_game <= Test_buget:
         abnormal_case = False
-        # === 从 GA 拿一个 seed（position_info） ===
+        # === Get a seed from GA (position_info) ===
         idx_in_pop = (number_game - 1) % population_size
         if len(scenario_confs) == population_size:
             scenario_conf = scenario_confs[idx_in_pop]["position_info"]
@@ -436,19 +436,19 @@ def main():
 
         success = demo.setup_vehicles_with_collision(scenario_conf)
         if not success:
-            print("[ERROR] 车辆生成失败，跳过（不计入有效回合）。")
+            print("[ERROR] Vehicle spawn failed, skipping (not counted as a valid episode).")
             scenario_confs[idx_in_pop] = GA.resample()
             continue
 
         actual_n = len(demo.vehicles)
         demo.vehicle_num = actual_n
         if actual_n < MIN_NPC:
-            print(f"[WARN] only {actual_n} NPC spawned (<{MIN_NPC}), 回滚重采样。")
+            print(f"[WARN] only {actual_n} NPC spawned (<{MIN_NPC}), rolling back and resampling.")
             demo.destroy_all()
             scenario_confs[idx_in_pop] = GA.resample()
             continue
 
-        print(f"[INFO] 请求 {scenario_conf.get('vehicle_num','?')}，实际生成 {actual_n} (有效回合序号 {number_game})")
+        print(f"[INFO] Requested {scenario_conf.get('vehicle_num','?')}, actually spawned {actual_n} (valid episode #{number_game})")
 
         controllers = []
         controller_by_actor_id = {}
@@ -461,7 +461,7 @@ def main():
             demo.ego_vehicle.set_autopilot(True, tm.get_port())
             tm.vehicle_percentage_speed_difference(demo.ego_vehicle, 5)
 
-        # 所有 NPC 上 TM
+        # Assign all NPCs to TM
         ego_id = demo.ego_vehicle.id if demo.ego_vehicle is not None else -1
         for v in demo.vehicles:
             if v.id != ego_id:
@@ -472,7 +472,7 @@ def main():
                 tm.ignore_walkers_percentage(v, 0)
                 tm.distance_to_leading_vehicle(v, 2.5)
 
-        # 录像
+        # Recording
         if RECORDING:
             camera_bp = world.get_blueprint_library().find('sensor.camera.rgb')
             camera_bp.set_attribute('image_size_x', '640')
@@ -504,17 +504,17 @@ def main():
         timeout_cnt = 0
         start_loc = None
 
-        # MOSAT 运行期状态（替换原 ART）
+        # MOSAT runtime state (replacing original ART)
         mosat_sequences = None   # dict[vid] -> [{"act": str, "steps": int}, ...]
         mosat_state = {}         # vid -> {"i": 0, "left": steps}
 
-        # 回放记录器
+        # Episode recorder
         rec = EpisodeRecorder(world_map)
 
         for mod in demo.modules:
             demo.enable_module(mod)
 
-        # ========== 主循环 ==========
+        # ========== Main loop ==========
         for step in range(50000):
             world.wait_for_tick()
 
@@ -522,12 +522,12 @@ def main():
                 print(f"[EARLY-EXIT] episode wall-clock > {EPISODE_MAX_SECONDS}s, stop.")
                 break
 
-            # 启动阶段
+            # Startup phase
             if step < STARTUP_STEPS:
                 ego_vel = demo.ego_vehicle.get_velocity()
                 speed_ego = math.sqrt(ego_vel.x ** 2 + ego_vel.y ** 2 + ego_vel.z ** 2)
                 if speed_ego > 5:
-                    print('[WARN] EGO 启动阶段速度异常偏高，结束该轮。')
+                    print('[WARN] EGO speed abnormally high during startup phase, ending this episode.')
                     abnormal_case = True
             if step == STARTUP_STEPS and demo.external_ads:
                 start_loc = demo.ego_vehicle.get_location()
@@ -536,7 +536,7 @@ def main():
                 demo.set_destination()
 
             if step > STARTUP_STEPS:
-                # TM 续权（排除正在接管的 NPC）
+                # TM keep-alive (exclude NPCs currently being taken over)
                 if step % KEEP_ALIVE_PERIOD == 0:
                     for v in demo.vehicles:
                         if v.id == ego_id or (v.id in mosat_state):
@@ -548,7 +548,7 @@ def main():
                         tm.ignore_walkers_percentage(v, 0)
                         tm.distance_to_leading_vehicle(v, 2.5)
 
-                # 非阻塞录像
+                # Non-blocking recording
                 if RECORDING and image_queue is not None:
                     try:
                         frame = image_queue.get_nowait()
@@ -558,7 +558,7 @@ def main():
                     except Exception:
                         pass
 
-                # 无进展超时
+                # No-progress timeout
                 ego_loc = demo.ego_vehicle.get_location()
                 if progress_anchor_loc is not None:
                     moved = math.hypot(ego_loc.x - progress_anchor_loc.x, ego_loc.y - progress_anchor_loc.y)
@@ -570,7 +570,7 @@ def main():
                         timeout_cnt = 1
                         break
 
-                # 到达或越过目的地
+                # Arrived at or passed destination
                 if demo.ego_destination is not None:
                     near_dest, pass_dest = has_passed_destination(demo.ego_vehicle, demo.ego_destination, world_map)
                     if step != 0 and demo.external_ads and near_dest:
@@ -581,7 +581,7 @@ def main():
                             for mod in demo.modules: demo.enable_module(mod)
                             print('pass destination error'); abnormal_case = True
 
-                # 摄像机跟随
+                # Camera follow
                 spectator = world.get_spectator()
                 trans = demo.ego_vehicle.get_transform()
                 loc = trans.location
@@ -596,11 +596,11 @@ def main():
                     carla.Rotation(pitch=-20, yaw=yaw_deg)
                 ))
 
-                # 记录一帧
+                # Log one frame
                 rec.log(demo.ego_vehicle, demo.vehicles)
 
-                # ========== MOSAT：按模体计划执行原子动作序列（替换 ART 块） ==========
-                # 第一次进入执行时生成计划（基于当下相对构型）
+                # ========== MOSAT: execute atomic action sequences according to motif plan (replaces ART block) ==========
+                # Generate plan on first entry (based on current relative configuration)
                 if (mosat_sequences is None) and (step == STARTUP_STEPS + 1):
                     mosat_sequences = mosat_plan_sequences(world_map, demo.ego_vehicle, demo.vehicles)
                     mosat_state = {}
@@ -608,7 +608,7 @@ def main():
                         if len(seq) > 0:
                             mosat_state[vid] = {"i": 0, "left": seq[0]["steps"]}
 
-                # 可选：每隔固定步长滚动重规划（让干扰更持久）
+                # Optional: rolling replan at fixed intervals (to sustain interference longer)
                 # if (step > STARTUP_STEPS) and (step % 200 == 0):
                 #     mosat_sequences = mosat_plan_sequences(world_map, demo.ego_vehicle, demo.vehicles)
                 #     mosat_state.clear()
@@ -616,7 +616,7 @@ def main():
                 #         if len(seq) > 0:
                 #             mosat_state[vid] = {"i": 0, "left": seq[0]["steps"]}
 
-                # 推进 MOSAT 序列
+                # Advance MOSAT sequences
                 if mosat_sequences is not None:
                     finished_vids = []
                     for v in demo.vehicles:
@@ -625,14 +625,14 @@ def main():
                         seq = mosat_sequences.get(v.id, [])
                         st = mosat_state.get(v.id)
                         if not seq or st is None:
-                            # 没有序列则回到 TM
+                            # No sequence, return to TM
                             v.set_autopilot(True, tm.get_port())
                             continue
 
-                        # 当前原子动作
+                        # Current atomic action
                         idx = st["i"]
                         if idx >= len(seq):
-                            # 序列结束 -> 交还 TM
+                            # Sequence ended -> return to TM
                             v.set_autopilot(True, tm.get_port())
                             finished_vids.append(v.id)
                             continue
@@ -643,28 +643,28 @@ def main():
                             v.set_autopilot(False)
                             action_trans(ctrl, act_name)
 
-                        # 递减剩余步计数
+                        # Decrement remaining step count
                         st["left"] -= 1
                         if st["left"] <= 0:
                             st["i"] += 1
                             if st["i"] < len(seq):
                                 st["left"] = seq[st["i"]]["steps"]
                             else:
-                                # 执行完毕，标记回 TM
+                                # Execution complete, mark for return to TM
                                 v.set_autopilot(True, tm.get_port())
                                 finished_vids.append(v.id)
 
-                    # 清理已完成
+                    # Clean up completed entries
                     for vid in finished_vids:
                         mosat_state.pop(vid, None)
 
-                # 环境统计（若碰撞，立即早退）
+                # Environment statistics (if collision, exit early immediately)
                 signals_list, ego_collision, all_collision, cross_solid_line, red_light = demo.tick()
                 if ego_collision or all_collision:
                     print("[EARLY-EXIT] collision detected. Ending episode immediately.")
                     break
 
-        # episode 尾：清空 apollo 的 prediction/planning 缓存（若有）
+        # End of episode: clear Apollo prediction/planning cache (if available)
         try:
             apollo_clear_prediction_planning(times=3, interval=0.05)
         except Exception as e:
@@ -679,7 +679,7 @@ def main():
             except Exception:
                 pass
 
-        # 结束检查
+        # End-of-episode check
         end_loc = demo.ego_vehicle.get_location()
         if start_loc is not None:
             distance_to_start = math.dist([start_loc.x, start_loc.y], [end_loc.x, end_loc.y])
@@ -687,10 +687,10 @@ def main():
             distance_to_start = 0.0
         print('Moved distance: ', distance_to_start)
         if distance_to_start < 1:
-            print("[WARNING] EGO 起点与终点距离 < 1m，判定异常，不计入本代。")
+            print("[WARNING] EGO start-to-end distance < 1m, deemed abnormal, excluded from this generation.")
             abnormal_case = True
 
-        # 统计 + GA 演化（仅对有效回合）
+        # Statistics + GA evolution (only for valid episodes)
         if not abnormal_case:
             side_total += demo.side_collision_count_vehicle
             obj_collison_total = demo.collision_count_obj
@@ -698,7 +698,7 @@ def main():
             red_light_total += demo.ego_run_red_light
             cross_solid_line_total += demo.ego_cross_solid_line
 
-            # 记录（含是否发生车辆侧碰）
+            # Log (including whether ego-vehicle side collision occurred)
             jsonable_conf = _to_jsonable(scenario_conf)
             collided_record = {
                 "ts": datetime.now().isoformat(),
@@ -721,7 +721,7 @@ def main():
                 "pos_info": scenario_conf
             })
 
-            # —— “半代”扩充（父代选择 + 交叉/变异）——
+            # —— Half-generation expansion (parent selection + crossover/mutation) ——
             if (number_game % population_size) == 0 and (number_game % (2 * population_size) != 0):
                 # diversity
                 diversity = []
@@ -729,10 +729,10 @@ def main():
                     eu_dis = average_population_distance(individual, scenario_confs)
                     diversity.append(-eu_dis)
                 fitness = {"safety_violation": [], "diversity": diversity, "ART_trigger_time": []}
-                # 用是否碰撞作为粗安全信号（仅示意，不影响 GA 内部排序接口）
+                # Use collision as a rough safety signal (illustrative only, does not affect GA internal ranking interface)
                 for rec_i in gen_records:
                     fitness["safety_violation"].append(-1 if rec_i["collided"] else 1)
-                    fitness["ART_trigger_time"].append(0)  # MOSAT 不再统计 ART 触发，填 0
+                    fitness["ART_trigger_time"].append(0)  # MOSAT no longer tracks ART triggers, fill with 0
                 print(fitness)
                 parents = parents_selection(fitness, scenario_confs, population_size)
                 for i in range(0, population_size, 2):
@@ -744,7 +744,7 @@ def main():
                     scenario_confs.append(child_1)
                     scenario_confs.append(child_2)
 
-            # —— 整代结束：SVGD 注入 + 下一代 ——
+            # —— Full generation end: SVGD injection + next generation ——
             if (number_game % (2 * population_size)) == 0:
 
                 diversity = []
@@ -754,7 +754,7 @@ def main():
                 fitness["diversity"] = diversity
                 for r in gen_records:
                     fitness["safety_violation"].append(-1 if r["collided"] else 1)
-                    fitness["ART_trigger_time"].append(0)  # MOSAT 无 ART
+                    fitness["ART_trigger_time"].append(0)  # MOSAT has no ART
                 scenario_confs = next_gen_selection(fitness, scenario_confs, population_size)
 
                 gen_records.clear()
@@ -770,7 +770,7 @@ def main():
             else:
                 scenario_confs[idx_in_pop + population_size] = GA.resample()
 
-            print(f"[INFO] 本轮异常，已回滚重采样（不计入有效回合）。")
+            print(f"[INFO] This episode was abnormal, rolled back and resampled (not counted as a valid episode).")
 
         demo.destroy_all()
 
@@ -779,7 +779,7 @@ def main():
                                        include_walkers=True, hard_teleport=True)
         print(f"[PURGE] left vehicles={rem_veh}, walkers={rem_walk}")
 
-    # ---- 结束统计 ----
+    # ---- Final Statistics ----
     print('Side collision (ego×vehicle):', side_total)
     print('Ego vehicle object collision:', obj_collison_total)
     print('Time Out:', timeout_total)

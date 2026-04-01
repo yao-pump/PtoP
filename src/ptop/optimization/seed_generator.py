@@ -23,7 +23,7 @@ def sample_position_info(carla_map):
     }
 
 def _sanitize_position_info(pi: dict) -> dict:
-    # 兼容旧字段：surrounding_transforms -> surrounding_info
+    # Backward compatibility: surrounding_transforms -> surrounding_info
     if 'surrounding_transforms' in pi and 'surrounding_info' not in pi:
         pi['surrounding_info'] = [{'transform': t, 'type': 'car'} for t in pi['surrounding_transforms']]
         pi.pop('surrounding_transforms', None)

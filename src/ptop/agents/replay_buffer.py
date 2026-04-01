@@ -1,5 +1,5 @@
 # replay_buffer.py
-# 轻量 near-miss 样本库（为分布采样与统计服务）
+# Lightweight near-miss sample buffer (for distribution sampling and statistics)
 
 import random
 

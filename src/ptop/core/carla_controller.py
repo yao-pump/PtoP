@@ -1,5 +1,5 @@
 # ===========================================
-# 文件: carla_controller.py
+# File: carla_controller.py
 # ===========================================
 import carla
 import math
@@ -13,27 +13,27 @@ WAYPOINT_INTERVAL = 2.0
 
 class LaneKeepAndChangeController:
     """
-    简易车道保持 + 变道(区分加速/减速) + 加减速 + 刹车示例。
-    run_step() 每帧返回 (control, signals)，其中 signals 用于标记各动作完成情况。
+    Simple lane keeping + lane change (with acceleration/deceleration variants) + speed control + braking controller.
+    run_step() returns (control, signals) each frame, where signals indicate the completion status of each action.
     """
     def __init__(self, vehicle):
         self.vehicle = vehicle
         self.world = vehicle.get_world()
         self.map = self.world.get_map()
 
-        # 状态: LaneKeep, LaneChangeAccel, LaneChangeDecel
+        # State: LaneKeep, LaneChangeAccel, LaneChangeDecel
         self.state = "LaneKeep"
 
         self.target_waypoints = []
         self.current_wp_idx = 0
 
-        # 额外控制量
+        # Extra control values
         self.extra_throttle = 0.0
         self.extra_brake = 0.0
 
     def run_step(self):
         """
-        返回 (control, signals)
+        Returns (control, signals)
         signals = {
             "lane_change_done": bool,
             "acceleration_done": bool,
@@ -44,7 +44,7 @@ class LaneKeepAndChangeController:
         """
         control = carla.VehicleControl()
 
-        # 1. 用于标记动作完成情况
+        # 1. Flags indicating action completion status
         signals = {
             "lane_change_done": False,
             "acceleration_done": False,
@@ -53,30 +53,30 @@ class LaneKeepAndChangeController:
             "release_brake_done": False,
         }
 
-        # 2. 纵向控制：基础PID + 状态修正 + extra_throttle / extra_brake
+        # 2. Longitudinal control: base PID + state correction + extra_throttle / extra_brake
         vel = self.vehicle.get_velocity()
         speed_ms = math.sqrt(vel.x**2 + vel.y**2 + vel.z**2)
         speed_kmh = speed_ms * 3.6
         speed_err = TARGET_SPEED_KMH - speed_kmh
 
-        # 基本PID油门
+        # Base PID throttle
         throttle = KP_SPEED * speed_err
 
-        # 根据不同状态增加/减少油门
+        # Adjust throttle based on different states
         if self.state == "LaneChangeAccel":
             throttle += 0.2
         elif self.state == "LaneChangeDecel":
             throttle -= 0.2
 
-        # 叠加手动API提供的extra_throttle / extra_brake
+        # Add manual API-provided extra_throttle / extra_brake
         throttle += self.extra_throttle
         brake = self.extra_brake
 
-        # 边界处理
+        # Boundary handling
         if throttle > 1.0:
             throttle = 1.0
         elif throttle < 0.0:
-            # 如果油门<0，则转化为刹车
+            # If throttle < 0, convert to braking
             brake = max(brake, -throttle)
             throttle = 0.0
             if brake > 1.0:
@@ -85,13 +85,13 @@ class LaneKeepAndChangeController:
         control.throttle = throttle
         control.brake = brake
 
-        # 3. 横向控制：根据状态决定车道保持 or 变道
+        # 3. Lateral control: decide lane keeping or lane change based on state
         if self.state == "LaneKeep":
             steer = self._lane_keep_steer()
         elif self.state in ["LaneChangeAccel", "LaneChangeDecel"]:
             steer, done = self._lane_change_steer()
             if done:
-                # 变道完成 => 回到LaneKeep
+                # Lane change complete => return to LaneKeep
                 self.state = "LaneKeep"
                 self.target_waypoints.clear()
                 self.current_wp_idx = 0
@@ -103,7 +103,7 @@ class LaneKeepAndChangeController:
         steer = max(-1.0, min(1.0, steer))
         control.steer = steer
 
-        # 4. 判断加速/减速/刹车是否到达边界
+        # 4. Check if acceleration/deceleration/braking has reached its limit
         if self.extra_throttle == 1.0:
             signals["acceleration_done"] = True
         if self.extra_throttle == -1.0:
@@ -147,11 +147,11 @@ class LaneKeepAndChangeController:
         loc = transform.location
         yaw_rad = math.radians(transform.rotation.yaw)
 
-        # 若已到达最后一个路点 => done
+        # If already reached the last waypoint => done
         if self.current_wp_idx >= len(self.target_waypoints):
             return (0.0, True)
 
-        # 找最近的目标路点
+        # Find the closest target waypoint
         min_dist = 1e9
         closest_idx = self.current_wp_idx
         for i in range(self.current_wp_idx, len(self.target_waypoints)):
@@ -164,11 +164,11 @@ class LaneKeepAndChangeController:
                 closest_idx = i
         self.current_wp_idx = closest_idx
 
-        # 若离最后一个路点足够近 => done
+        # If close enough to the last waypoint => done
         if self.current_wp_idx >= len(self.target_waypoints) - 1:
             return (0.0, True)
 
-        # 向前查看一段距离
+        # Look ahead a certain distance
         look_idx = self.current_wp_idx
         dist_accum = 0.0
         tmp_wp = self.target_waypoints[look_idx]
@@ -189,10 +189,10 @@ class LaneKeepAndChangeController:
         heading_err = math.atan2(fy, fx)
         return (heading_err, False)
 
-    # ========== 对外API：变道、加减速、刹车等 ==========
+    # ========== Public API: lane change, acceleration/deceleration, braking, etc. ==========
 
     def request_lane_change_accel(self, direction:str, distance=LANE_CHANGE_DISTANCE):
-        """请求加速变道。若请求被接受则返回 True；若正在变道中则返回 False。"""
+        """Request an accelerating lane change. Returns True if accepted; False if a lane change is already in progress."""
         if self.state in ["LaneChangeAccel", "LaneChangeDecel"]:
             return False
 
@@ -202,17 +202,17 @@ class LaneKeepAndChangeController:
 
         wps = self._gen_lanechange_wps(side_wp, distance, WAYPOINT_INTERVAL)
         if len(wps) < 2:
-            print("[WARN] 变道Waypoints不足")
+            print("[WARN] Insufficient lane change waypoints")
             return False
 
         self.target_waypoints = wps
         self.current_wp_idx = 0
         self.state = "LaneChangeAccel"
-        # print(f"[INFO] 开始向 {direction} 加速变道, lane_id={side_wp.lane_id}")
+        # print(f"[INFO] Starting accelerating lane change toward {direction}, lane_id={side_wp.lane_id}")
         return True
 
     def request_lane_change_decel(self, direction:str, distance=LANE_CHANGE_DISTANCE):
-        """请求减速变道。若请求被接受则返回 True；若正在变道中则返回 False。"""
+        """Request a decelerating lane change. Returns True if accepted; False if a lane change is already in progress."""
         if self.state in ["LaneChangeAccel", "LaneChangeDecel"]:
             return False
 
@@ -222,18 +222,18 @@ class LaneKeepAndChangeController:
 
         wps = self._gen_lanechange_wps(side_wp, distance, WAYPOINT_INTERVAL)
         if len(wps) < 2:
-            print("[WARN] 变道Waypoints不足")
+            print("[WARN] Insufficient lane change waypoints")
             return False
 
         self.target_waypoints = wps
         self.current_wp_idx = 0
         self.state = "LaneChangeDecel"
-        # print(f"[INFO] 开始向 {direction} 减速变道, lane_id={side_wp.lane_id}")
+        # print(f"[INFO] Starting decelerating lane change toward {direction}, lane_id={side_wp.lane_id}")
         return True
 
     def _get_side_waypoint(self, direction: str):
         """
-        封装获取左右车道的逻辑，若不可行则返回None。
+        Encapsulates the logic for obtaining the left/right lane; returns None if not feasible.
         """
         loc = self.vehicle.get_location()
         current_wp = self.map.get_waypoint(loc, lane_type=carla.LaneType.Driving)
@@ -250,7 +250,7 @@ class LaneKeepAndChangeController:
         if side_wp.lane_type != carla.LaneType.Driving:
             return None
 
-        # 如果 lane_id 异号 => 对向车道 => 放弃
+        # If lane_id signs differ => opposite lane => abandon
         if side_wp.lane_id * current_wp.lane_id <= 0:
             return None
 
@@ -274,7 +274,7 @@ class LaneKeepAndChangeController:
 
     def accelerate(self, val=0.1):
         """
-        增加额外油门；可返回是否已到达油门上限 (True/False)
+        Increase extra throttle; returns whether the throttle upper limit has been reached (True/False).
         """
         self.extra_throttle += val
         if self.extra_throttle > 1.0:
@@ -283,7 +283,7 @@ class LaneKeepAndChangeController:
 
     def decelerate(self, val=0.1):
         """
-        减少额外油门；可返回是否已到达油门下限 (True/False)
+        Decrease extra throttle; returns whether the throttle lower limit has been reached (True/False).
         """
         self.extra_throttle -= val
         if self.extra_throttle < -1.0:
@@ -292,7 +292,7 @@ class LaneKeepAndChangeController:
 
     def brake(self, val=0.1):
         """
-        增大刹车；可返回是否已刹车到底 (True/False)
+        Increase braking; returns whether maximum braking has been reached (True/False).
         """
         self.extra_brake += val
         if self.extra_brake > 1.0:
@@ -301,7 +301,7 @@ class LaneKeepAndChangeController:
 
     def release_brake(self, val=0.1):
         """
-        减小刹车；可返回是否已完全松开 (True/False)
+        Decrease braking; returns whether the brake has been fully released (True/False).
         """
         self.extra_brake -= val
         if self.extra_brake < 0.0:

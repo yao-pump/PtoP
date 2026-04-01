@@ -9,13 +9,13 @@ def _yaw_rad(tf: carla.Transform) -> float:
 
 def to_local_SE2(ego_tf: carla.Transform, npc_tf: carla.Transform):
     """
-    把 NPC 世界位姿投到 EGO 局部坐标:
-    返回 (s, d, psi) 其中 psi = npc_yaw - ego_yaw (弧度)
+    Project NPC world pose into EGO local coordinates:
+    Returns (s, d, psi) where psi = npc_yaw - ego_yaw (radians)
     """
     ex, ey = ego_tf.location.x, ego_tf.location.y
     nx, ny = npc_tf.location.x, npc_tf.location.y
     dyaw = math.radians(npc_tf.rotation.yaw - ego_tf.rotation.yaw)
-    # EGO 前/右向量
+    # EGO forward/right vectors
     yaw = _yaw_rad(ego_tf)
     f = np.array([math.cos(yaw), math.sin(yaw)])  # forward
     r = np.array([-math.sin(yaw), math.cos(yaw)]) # right
@@ -35,7 +35,7 @@ def local_pose_batch(ego_tf: carla.Transform, npc_tfs):
 
 def waypoint_signed_lat(world_map: carla.Map, tf: carla.Transform) -> float:
     """
-    返回 NPC 到其所在线中心的有符号横向距离（右为正）
+    Return the signed lateral distance from the NPC to its lane center (positive to the right).
     """
     w = world_map.get_waypoint(tf.location, project_to_road=True, lane_type=carla.LaneType.Driving)
     if w is None:
@@ -48,7 +48,7 @@ def waypoint_signed_lat(world_map: carla.Map, tf: carla.Transform) -> float:
 
 def waypoint_curvature(world_map: carla.Map, tf: carla.Transform, ds: float = 2.0) -> float:
     """
-    近似曲率：取前后 ds 的两个路点，三点拟合圆弧半径。返回标量曲率（可为 0）。
+    Approximate curvature: take two waypoints ds ahead and behind, fit a circular arc through the three points. Returns scalar curvature (can be 0).
     """
     w0 = world_map.get_waypoint(tf.location, project_to_road=True, lane_type=carla.LaneType.Driving)
     if w0 is None: return 0.0
@@ -57,7 +57,7 @@ def waypoint_curvature(world_map: carla.Map, tf: carla.Transform, ds: float = 2.
     p = np.array([w0.transform.location.x, w0.transform.location.y])
     p1 = np.array([w1.transform.location.x, w1.transform.location.y])
     p_1 = np.array([w_1.transform.location.x, w_1.transform.location.y])
-    # 曲率 = |(p1-p0) x (p0-p_1)| / (|p1-p0| * |p0-p_1| * |p1-p_1|)
+    # curvature = |(p1-p0) x (p0-p_1)| / (|p1-p0| * |p0-p_1| * |p1-p_1|)
     a = p1 - p; b = p - p_1; c = p1 - p_1
     den = (np.linalg.norm(a) * np.linalg.norm(b) * np.linalg.norm(c) + 1e-9)
     num = abs(a[0]*b[1] - a[1]*b[0])
@@ -87,7 +87,7 @@ def map_context_batch(world: carla.World, tfs):
         "lane_center_dist": lane_lat,           # m
         "curvature": curvature,                 # ~1/m
         "is_intersection": is_intersection,     # {0,1}
-        "speed_limit": speed_limit              # km/h or m/s (CARLA单位为km/h? 具体按API返回)
+        "speed_limit": speed_limit              # km/h or m/s (CARLA unit is km/h? depends on API return value)
     }
 
 def featurize_particles(particles: torch.Tensor, ctx: dict) -> torch.Tensor:
@@ -109,9 +109,9 @@ def featurize_particles(particles: torch.Tensor, ctx: dict) -> torch.Tensor:
     return torch.cat(feats, dim=1)
 
 def scene_fingerprint(world: carla.World, ego_tf: carla.Transform) -> str:
-    """
-    用于把样本按“场景簇”归档（简单可用：road_id + 是否路口）。
-    """
+    “””
+    Used to archive samples by “scenario cluster” (simple approach: road_id + whether at junction).
+    “””
     wm = world.get_map()
     w = wm.get_waypoint(ego_tf.location, project_to_road=True, lane_type=carla.LaneType.Driving)
     if w is None:

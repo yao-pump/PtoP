@@ -84,23 +84,23 @@ def check_wall_intersection(start_pos, angle, bound, L):
 
 def cal_triangle_S(p1, p2, p3):
     """
-    计算由 (p1, p2, p3) 三点在2D平面围成的三角形面积。
-    与你原先的函数相同，只是做了变量命名上更简洁的写法。
+    Compute the area of a triangle formed by three points (p1, p2, p3) in 2D plane.
+    Same as the original function, just with more concise variable naming.
     """
     S = abs(0.5 * ((p2[0] - p1[0]) * (p3[1] - p1[1])
                    - (p3[0] - p1[0]) * (p2[1] - p1[1])))
-    # 如果非常接近0，则返回0
+    # If very close to 0, return 0
     if math.isclose(S, 0.0, abs_tol=1e-9):
         return 0.0
     else:
         return S
 
 def cal_polygon_area(points):
-    """
-    使用“鞋带公式”计算多边形面积。
-    points: 形如 [(x0, y0), (x1, y1), ..., (x_{k-1}, y_{k-1})] 的顶点坐标列表或 numpy 数组
-    返回值: 多边形面积(浮点数)
-    """
+    “””
+    Compute polygon area using the “shoelace formula”.
+    points: vertex coordinate list or numpy array of the form [(x0, y0), (x1, y1), ..., (x_{k-1}, y_{k-1})]
+    Returns: polygon area (float)
+    “””
     area = 0.0
     n = len(points)
     for i in range(n):
@@ -108,7 +108,7 @@ def cal_polygon_area(points):
         x2, y2 = points[(i + 1) % n][0], points[(i + 1) % n][1]
         area += (x1 * y2 - x2 * y1)
     S = abs(0.5 * area)
-    # 如果非常接近0，则返回0
+    # If very close to 0, return 0
     if math.isclose(S, 0.0, abs_tol=1e-9):
         return 0.0
     else:
