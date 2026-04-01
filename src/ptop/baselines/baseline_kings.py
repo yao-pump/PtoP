@@ -13,6 +13,7 @@ Dependencies:
   - utility.has_passed_destination (check whether destination is reached)
 “””
 
+import logging
 import os
 import cv2
 import math
@@ -27,6 +28,8 @@ import torch
 import torch.nn as nn
 import carla
 
+logger = logging.getLogger(__name__)
+
 # ---- Optional dependencies: provide empty implementations if not available ----
 try:
     from ptop.utils.utility import has_passed_destination, apollo_clear_prediction_planning, purge_npcs
@@ -35,6 +38,7 @@ except Exception:
     def apollo_clear_prediction_planning(*args, **kwargs): pass
     def purge_npcs(world, client, tm=None, keep_actor_ids=None, include_walkers=True, hard_teleport=True): return 0, 0
 
+from ptop.utils.geometry import yaw_to_unit, ego_local_sd
 from ptop.core.world import MultiVehicleDemo
 
 # ====================== Global Hyperparameters ======================
@@ -75,18 +79,6 @@ V_MIN, V_MAX = 0.0, 25.0  # Speed lower/upper bounds
 TEST_BUDGET = 400
 
 # ====================== Geometry / Utilities ======================
-def _yaw_to_unit(yaw_deg: float):
-    r = math.radians(yaw_deg)
-    return math.cos(r), math.sin(r)
-
-def ego_local_sd(ego_tf: carla.Transform, pt: carla.Location):
-    dx = pt.x - ego_tf.location.x
-    dy = pt.y - ego_tf.location.y
-    cy, sy = _yaw_to_unit(ego_tf.rotation.yaw)
-    s =  dx * cy + dy * sy
-    d = -dx * sy + dy * cy
-    return s, d
-
 def to_state(actor: carla.Actor):
     tf = actor.get_transform()
     vel = actor.get_velocity()
@@ -269,13 +261,13 @@ def main():
         # === Spawn vehicles and collision sensors ===
         success = demo.setup_vehicles_with_collision(scenario_conf)
         if not success:
-            print("[ERROR] Vehicle spawn failed, skipping episode.")
+            logger.error("Vehicle spawn failed, skipping episode.")
             continue
 
         actual_n = len(demo.vehicles)
         demo.vehicle_num = actual_n
         if actual_n < MIN_NPC:
-            print(f"[WARN] only {actual_n} NPC spawned (<{MIN_NPC}), skipping episode.")
+            logger.warning("only %d NPC spawned (<%d), skipping episode.", actual_n, MIN_NPC)
             demo.destroy_all()
             continue
 
@@ -346,7 +338,7 @@ def main():
             world.wait_for_tick()
 
             if time.monotonic() - wall_start > EPISODE_MAX_SECONDS:
-                print(f"[EARLY-EXIT] wall-clock > {EPISODE_MAX_SECONDS}s")
+                logger.warning("EARLY-EXIT: wall-clock > %ss", EPISODE_MAX_SECONDS)
                 break
 
             # Startup phase
@@ -354,7 +346,7 @@ def main():
                 ego_vel = demo.ego_vehicle.get_velocity()
                 speed_ego = math.sqrt(ego_vel.x**2 + ego_vel.y**2 + ego_vel.z**2)
                 if speed_ego > 5:
-                    print('[WARN] Abnormal EGO speed during startup phase, ending this episode.')
+                    logger.warning("Abnormal EGO speed during startup phase, ending this episode.")
                     abnormal_case = True
             if step == STARTUP_STEPS and demo.external_ads:
                 start_loc = demo.ego_vehicle.get_location()
@@ -373,7 +365,7 @@ def main():
                 # tick & early exit
                 signals_list, ego_collision, all_collision, cross_solid_line, red_light = demo.tick()
                 if ego_collision or all_collision:
-                    print("[EARLY-EXIT] Collision detected, ending episode.")
+                    logger.warning("EARLY-EXIT: Collision detected, ending episode.")
                     break
 
                 # Recording frame
@@ -394,7 +386,7 @@ def main():
                         progress_anchor_loc = ego_loc
                         progress_anchor_t = time.monotonic()
                     elif time.monotonic() - progress_anchor_t > NO_PROGRESS_SECONDS:
-                        print(f"[EARLY-EXIT] no progress for {NO_PROGRESS_SECONDS}s (Δ={moved:.2f}m).")
+                        logger.warning("EARLY-EXIT: no progress for %ds (delta=%.2fm).", NO_PROGRESS_SECONDS, moved)
                         timeout_cnt = 1
                         break
 
@@ -417,11 +409,11 @@ def main():
                 if demo.ego_destination is not None:
                     near_dest, pass_dest = has_passed_destination(demo.ego_vehicle, demo.ego_destination, world_map)
                     if step != 0 and demo.external_ads and near_dest:
-                        print('Arrive, episode end')
+                        logger.info("Arrive, episode end")
                         break
                     elif pass_dest:
                         for mod in demo.modules: demo.enable_module(mod)
-                        print('pass destination error'); abnormal_case = True
+                        logger.error("pass destination error"); abnormal_case = True
 
                 # === KING: replan every REPLAN_STRIDE ticks ===
                 if (step % REPLAN_STRIDE) == 0 and attack_list:
@@ -431,7 +423,7 @@ def main():
                             a, delta = planner.plan_once(ego_x0, to_state(v), v.id)
                             apply_king_control(v, a, delta)
                         except Exception as e:
-                            print(f"[WARN] Planning error for veh {v.id}: {e}")
+                            logger.warning("Planning error for veh %s: %s", v.id, e)
                             v.set_autopilot(True, tm.get_port())
 
         # End of episode: clear Apollo cache (optional)
@@ -456,7 +448,7 @@ def main():
             distance_to_start = math.dist([start_loc.x, start_loc.y], [end_loc.x, end_loc.y])
         else:
             distance_to_start = 0.0
-        print('Moved distance: ', distance_to_start)
+        logger.info("Moved distance: %s", distance_to_start)
         if distance_to_start < 1:
             print("[WARNING] EGO start-to-end distance < 1m, deemed abnormal, excluded from statistics.")
             abnormal_case = True

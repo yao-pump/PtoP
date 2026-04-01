@@ -16,17 +16,19 @@ import math
 import time
 import shutil
 import random
+import logging
 import numpy as np
 from queue import Queue
-import torch
-from datetime import datetime
 import torch
 import torch.nn as nn
 import carla
 
 from ptop.utils.utility import (
-    has_passed_destination, action_trans, apollo_clear_prediction_planning, purge_npcs, ego_local_sd, _to_jsonable, append_jsonl
+    has_passed_destination, action_trans, apollo_clear_prediction_planning, purge_npcs, _to_jsonable, append_jsonl
 )
+from ptop.utils.geometry import yaw_to_unit, ego_local_sd
+
+logger = logging.getLogger(__name__)
 
 from ptop.optimization.surrogate_mlp import NPCHazardMLPSurrogate
 from ptop.core.world import MultiVehicleDemo
@@ -59,17 +61,6 @@ U_CLAMP_ABS = 4.0         # FIX: clamp U after each step to prevent explosion
 GRAD_CLIP_NORM = 10.0     # FIX: gradient clipping
 
 # ====================== Geometry / Utilities ======================
-def _yaw_to_unit(yaw_deg: float):
-    r = math.radians(yaw_deg)
-    return math.cos(r), math.sin(r)
-
-def ego_local_sd(ego_tf: carla.Transform, pt: carla.Location):
-    dx = pt.x - ego_tf.location.x
-    dy = pt.y - ego_tf.location.y
-    cy, sy = _yaw_to_unit(ego_tf.rotation.yaw)
-    s =  dx * cy + dy * sy
-    d = -dx * sy + dy * cy
-    return s, d
 
 def to_state(actor: carla.Actor):
     tf = actor.get_transform()
@@ -579,20 +570,20 @@ def main():
             min_sep=MIN_SEP
         )
         svgd_runner.refine_position_info(pos_info)
-        print("seed is refined by SVGD.")
+        logger.info("seed is refined by SVGD.")
 
         success = demo.setup_vehicles_with_collision(pos_info)
         if not success:
-            print("[ERROR] Vehicle/pedestrian spawn failed, skipping (not counted as a valid episode).")
+            logger.error("Vehicle/pedestrian spawn failed, skipping (not counted as a valid episode).")
             continue
 
         actual_n = len(demo.vehicles) + len(demo.pedestrians)
         if actual_n < MIN_NPC:
-            print(f"[WARN] only {actual_n} NPC spawned (<{MIN_NPC}), rolling back and resampling.")
+            logger.warning("only %d NPC spawned (<%d), rolling back and resampling.", actual_n, MIN_NPC)
             demo.destroy_all()
             continue
 
-        print(f"[INFO] Requested {pos_info.get('vehicle_num','?')}, actually spawned {actual_n} (valid episode number {number_game})")
+        logger.info("Requested %s, actually spawned %d (valid episode number %d)", pos_info.get('vehicle_num','?'), actual_n, number_game)
 
         # Record vehicle controllers (if any)
         controllers = []
@@ -689,7 +680,7 @@ def main():
             world.wait_for_tick()
 
             if time.monotonic() - wall_start > EPISODE_MAX_SECONDS:
-                print(f"[EARLY-EXIT] wall-clock > {EPISODE_MAX_SECONDS}s")
+                logger.info("EARLY-EXIT: wall-clock > %ss", EPISODE_MAX_SECONDS)
                 break
 
             # Startup phase
@@ -697,7 +688,7 @@ def main():
                 ego_vel = demo.ego_vehicle.get_velocity()
                 speed_ego = math.sqrt(ego_vel.x ** 2 + ego_vel.y ** 2 + ego_vel.z ** 2)
                 if speed_ego > 5:
-                    print('[WARN] Abnormal EGO speed during startup phase, ending this episode.')
+                    logger.warning("Abnormal EGO speed during startup phase, ending this episode.")
                     abnormal_case = True
             if step == STARTUP_STEPS and demo.external_ads:
                 start_loc = demo.ego_vehicle.get_location()
@@ -716,7 +707,7 @@ def main():
                 # tick & early exit
                 signals_list, ego_collision, all_collision, cross_solid_line, red_light = demo.tick()
                 if ego_collision or all_collision:
-                    print("[EARLY-EXIT] Collision, ending episode.")
+                    logger.info("EARLY-EXIT: Collision, ending episode.")
                     break
 
                 # Recording frame
@@ -744,7 +735,7 @@ def main():
                         progress_anchor_loc = ego_loc
                         progress_anchor_t = time.monotonic()
                     elif time.monotonic() - progress_anchor_t > NO_PROGRESS_SECONDS:
-                        print(f"[EARLY-EXIT] no progress for {NO_PROGRESS_SECONDS}s (Δ={moved:.2f}m).")
+                        logger.info("EARLY-EXIT: no progress for %ds (delta=%.2fm).", NO_PROGRESS_SECONDS, moved)
                         timeout_cnt = 1
                         break
 
@@ -767,11 +758,11 @@ def main():
                 if demo.ego_destination is not None:
                     near_dest, pass_dest = has_passed_destination(demo.ego_vehicle, demo.ego_destination, world_map)
                     if step != 0 and demo.external_ads and near_dest:
-                        print('Arrive, episode end')
+                        logger.info("Arrive, episode end")
                         break
                     elif pass_dest:
                         for mod in demo.modules: demo.enable_module(mod)
-                        print('pass destination error')
+                        logger.warning("pass destination error")
                         abnormal_case = True
 
                 # === Planning and Control ===
@@ -784,7 +775,7 @@ def main():
                             a, delta = planner.plan_once(ego_x0, to_state(v), v.id)
                             apply_king_control(v, a, delta)
                         except Exception as e:
-                            print(f"[WARN] Vehicle planning exception veh {v.id}: {e}")
+                            logger.warning("Vehicle planning exception veh %s: %s", v.id, e)
                             v.set_autopilot(True, tm.get_port())
 
                     # Pedestrians: re-plan + sanitize + apply control
@@ -795,7 +786,7 @@ def main():
                             last_walker_cmd[w.id] = (vx, vy)
                             apply_walker_control(w, vx, vy)
                         except Exception as e:
-                            print(f"[WARN] Pedestrian planning exception walker {w.id}: {e}")
+                            logger.warning("Pedestrian planning exception walker %s: %s", w.id, e)
                 else:
                     # Non-planning step: re-apply previous frame's pedestrian control (with re-sanitization)
                     for w in attack_walkers:
@@ -813,7 +804,7 @@ def main():
                         try:
                             vx, vy = last_walker_cmd.get(w.id, (0.0, 0.0))
                             loc = w.get_transform().location
-                            print(f"[W-DBG] step={step} id={w.id} cmd=({vx:.2f},{vy:.2f}) pos=({loc.x:.1f},{loc.y:.1f})")
+                            logger.debug("step=%d id=%s cmd=(%.2f,%.2f) pos=(%.1f,%.1f)", step, w.id, vx, vy, loc.x, loc.y)
                         except Exception:
                             pass
 
@@ -821,7 +812,7 @@ def main():
         try:
             apollo_clear_prediction_planning(times=3, interval=0.05)
         except Exception as e:
-            print(f"[WARN] apollo_clear_prediction_planning failed: {e}")
+            logger.warning("apollo_clear_prediction_planning failed: %s", e)
 
         for _ in range(150):
             world.wait_for_tick()
@@ -838,9 +829,9 @@ def main():
             distance_to_start = math.dist([start_loc.x, start_loc.y], [end_loc.x, end_loc.y])
         else:
             distance_to_start = 0.0
-        print('Moved distance: ', distance_to_start)
+        logger.info("Moved distance: %s", distance_to_start)
         if distance_to_start < 1:
-            print("[WARNING] EGO start-to-end distance < 1m, classified as abnormal, not counted in this generation.")
+            logger.warning("EGO start-to-end distance < 1m, classified as abnormal, not counted in this generation.")
             abnormal_case = True
 
         seed_gen.executed_seed_set.append(scenario_conf)
@@ -867,7 +858,7 @@ def main():
                     pass
 
             peak_y = float(dataset_tuple[1].max()) if n_samples > 0 else 0.0
-            print(f"[EP-END] train-steps={steps_done}, loss≈{avg_loss:.4f}, n={n_samples}, peak_F={peak_y:.3f}")
+            logger.info("EP-END: train-steps=%d, loss=%.4f, n=%d, peak_F=%.3f", steps_done, avg_loss, n_samples, peak_y)
 
             jsonable_conf = _to_jsonable(pos_info)
             collided_record = {
@@ -881,7 +872,7 @@ def main():
                 "scenario_conf": jsonable_conf
             }
             append_jsonl(COLLIDED_JSONL, collided_record)
-            print(f"[SAVED] scenario appended to {COLLIDED_JSONL}")
+            logger.info("SAVED: scenario appended to %s", COLLIDED_JSONL)
             if demo.side_collision_count_vehicle == 0 and RECORDING and os.path.isdir(save_dir):
                 shutil.rmtree(save_dir)
 
@@ -890,22 +881,22 @@ def main():
             abnormal_count += 1
             if RECORDING and os.path.isdir(save_dir):
                 shutil.rmtree(save_dir)
-            print(f"[INFO] This episode was abnormal, rolled back and resampled (not counted as a valid episode).")
+            logger.info("This episode was abnormal, rolled back and resampled (not counted as a valid episode).")
 
         demo.destroy_all()
 
         keep_ids = {demo.ego_vehicle.id} if demo.ego_vehicle else set()
         rem_veh, rem_walk = purge_npcs(world, client, tm=tm, keep_actor_ids=keep_ids,
                                        include_walkers=True, hard_teleport=True)
-        print(f"[PURGE] left vehicles={rem_veh}, walkers={rem_walk}")
+        logger.info("PURGE: left vehicles=%d, walkers=%d", rem_veh, rem_walk)
 
     # ---- Final Statistics ----
-    print('Side collision (ego×vehicle):', side_total)
-    print('Ego vehicle object collision:', obj_collison_total)
-    print('Time Out:', timeout_total)
-    print('red light:', red_light_total)
+    logger.info("Side collision (ego x vehicle): %d", side_total)
+    logger.info("Ego vehicle object collision: %d", obj_collison_total)
+    logger.info("Time Out: %d", timeout_total)
+    logger.info("red light: %d", red_light_total)
     demo.destroy_all(); demo.close_connection()
-    print("Cleanup done.")
+    logger.info("Cleanup done.")
 
 if __name__ == "__main__":
     main()

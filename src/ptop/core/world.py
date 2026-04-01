@@ -12,6 +12,8 @@ import numpy as np
 import collections
 import os
 
+from ptop.utils.geometry import ego_local_sd, vec_norm, unit_vec, dot, spd_and_vec
+
 max_search_distance_for_destination = 200  # Maximum BFS search distance
 step_dist_for_destination = 2.0            # BFS step distance (meters)
 max_search_distance_for_spawns = 50.0      # Used for multi-lane spawn point selection
@@ -25,83 +27,6 @@ EGO_FAULT_RATIO          = 0.60   # Ratio threshold of EGO approach speed to tot
 IMPULSE_MIN              = 400.0  # Collision impulse lower bound; too small can be considered a scrape/false positive
 REAR_END_BONUS           = 0.05   # Slightly relaxed ratio threshold for rear-end scenarios
 
-# -------- Utilities: vector/speed/unit vector/dot product --------
-def _vec_norm(v):
-    return math.sqrt(v.x*v.x + v.y*v.y + v.z*v.z)
-
-def _spd_and_vec(actor):
-    v = actor.get_velocity()
-    return _vec_norm(v), v
-
-def _unit_vec(a: "carla.Location", b: "carla.Location"):
-    dx, dy, dz = (b.x - a.x), (b.y - a.y), (b.z - a.z)
-    n = math.sqrt(dx*dx + dy*dy + dz*dz) + 1e-9
-    return carla.Vector3D(dx/n, dy/n, dz/n)
-
-def _dot(a: "carla.Vector3D", b: "carla.Vector3D"):
-    return a.x*b.x + a.y*b.y + a.z*b.z
-
-# If your file doesn't have ego_local_sd, copy your existing implementation here
-def _ego_local_sd(ego_tf: "carla.Transform", loc: "carla.Location"):
-    yaw = math.radians(ego_tf.rotation.yaw)
-    cy, sy = math.cos(yaw), math.sin(yaw)
-    dx = loc.x - ego_tf.location.x
-    dy = loc.y - ego_tf.location.y
-    s =  dx * cy + dy * sy
-    d = -dx * sy + dy * cy
-    return s, d
-
-def _assign_blame_ego(ego: "carla.Vehicle",
-                      other: "carla.Actor",
-                      world_map: "carla.Map",
-                      event_normal_impulse: "carla.Vector3D") -> (bool, str):
-    """
-    Returns: (ego_fault: bool, why: str)
-    Determination criteria:
-      1) Take the unit vector n from ego->other, compute approach speed components c_ego, c_other along +/-n;
-      2) Ratio r = c_ego / (c_ego + c_other);
-      3) If: impulse is large enough & c_ego exceeds minimum & r >= threshold (slightly relaxed for rear-end) => blame EGO.
-    """
-    try:
-        # Position / connecting unit vector (from EGO toward the other)
-        loc_e = ego.get_transform().location
-        loc_o = other.get_transform().location
-        n = _unit_vec(loc_e, loc_o)
-
-        # Speed and “approach component” along the connecting line
-        spd_e, v_e = _spd_and_vec(ego)
-        if hasattr(other, "get_velocity"):
-            spd_o, v_o = _spd_and_vec(other)
-        else:
-            spd_o, v_o = 0.0, carla.Vector3D(0.0, 0.0, 0.0)
-
-        # EGO velocity component toward the other (>0 means moving toward other)
-        c_ego   = max(0.0, _dot(v_e, n))
-        # OTHER velocity component toward EGO: other faces -n, equivalent to -(v_o dot n)
-        c_other = max(0.0, -_dot(v_o, n))
-
-        # Impulse magnitude
-        J = _vec_norm(event_normal_impulse)
-
-        # Pose relationship (for identifying rear-end / side collision)
-        s_rel, d_rel = _ego_local_sd(ego.get_transform(), loc_o)  # s>0: other is ahead of EGO
-        rear_end_like = (s_rel > 0.0 and c_ego > c_other)  # More like EGO rear-ending the vehicle ahead
-        # For side scrapes d_rel is large; could raise IMPULSE_MIN or lower weight (kept simple here)
-
-        # Ratio and threshold
-        r = c_ego / (c_ego + c_other + 1e-9)
-        thr = EGO_FAULT_RATIO - (REAR_END_BONUS if rear_end_like else 0.0)
-
-        # Determination
-        if J >= IMPULSE_MIN and c_ego >= EGO_FAULT_CLOSE_SPEED_MIN and r >= thr:
-            reason = f"ego_fault: J={J:.1f}, c_ego={c_ego:.2f}, c_other={c_other:.2f}, r={r:.2f}, rear_end={rear_end_like}"
-            return True, reason
-        else:
-            reason = f"non_ego_fault: J={J:.1f}, c_ego={c_ego:.2f}, c_other={c_other:.2f}, r={r:.2f}, rear_end={rear_end_like}"
-            return False, reason
-    except Exception as e:
-        # On error, conservatively do not blame EGO
-        return False, f"non_ego_fault: exception {e}"
 def fetch_localization_variable(url="http://127.0.0.1:5000/var"):
     """
     Fetch the latest localization data from the container via HTTP GET request.
@@ -114,7 +39,7 @@ def fetch_localization_variable(url="http://127.0.0.1:5000/var"):
         data = response.json()
         return data
     except Exception as e:
-        print("Error occurred while fetching variable data:", e)
+        log.error("Error occurred while fetching variable data: %s", e)
         return None
 
 def distance(loc1, loc2):
@@ -215,7 +140,7 @@ class MultiVehicleDemo:
             npc_tf = npc.get_transform()
 
             # Relative longitudinal/lateral in ego coordinate frame
-            s_rel, d_rel = self._ego_local_sd(ego_tf, npc_tf.location)
+            s_rel, d_rel = ego_local_sd(ego_tf, npc_tf.location)
 
             # Ego forward unit vector
             yaw = math.radians(ego_tf.rotation.yaw)
@@ -245,12 +170,12 @@ class MultiVehicleDemo:
         try:
             self.ws = create_connection(self.url)
             self.ws_running = True
-            print(f"[INFO] Connected to WebSocket server: {self.url}")
+            log.info("Connected to WebSocket server: %s", self.url)
             # Start a thread to receive messages
             self.ws_thread = threading.Thread(target=self._receive_messages, daemon=True)
             self.ws_thread.start()
         except WebSocketException as e:
-            print(f"[ERROR] Unable to connect to WebSocket server: {e}")
+            log.error("Unable to connect to WebSocket server: %s", e)
             self.ws = None
 
     def _receive_messages(self):
@@ -260,10 +185,10 @@ class MultiVehicleDemo:
                 if result:
                     self.ws_receive_buffer.append(result)
             except WebSocketException as e:
-                print(f"[ERROR] Error while receiving WebSocket message: {e}")
+                log.error("Error while receiving WebSocket message: %s", e)
                 self.ws_running = False
             except Exception as e:
-                print(f"[ERROR] Unknown error: {e}")
+                log.error("Unknown error: %s", e)
                 self.ws_running = False
 
     def _compute_map_bounds(self):
@@ -272,7 +197,7 @@ class MultiVehicleDemo:
         """
         wps = self.map.generate_waypoints(2.0)
         if not wps:
-            print("[WARN] generate_waypoints is empty, no map data?")
+            log.warning("generate_waypoints is empty, no map data?")
             return (0, 0, 0, 0)
 
         min_x, max_x = float('inf'), float('-inf')
@@ -283,7 +208,7 @@ class MultiVehicleDemo:
             if loc.x > max_x: max_x = loc.x
             if loc.y < min_y: min_y = loc.y
             if loc.y > max_y: max_y = loc.y
-        print(f"[INFO] Map x range=({min_x:.1f},{max_x:.1f}), y range=({min_y:.1f},{max_y:.1f})")
+        log.info("Map x range=(%.1f,%.1f), y range=(%.1f,%.1f)", min_x, max_x, min_y, max_y)
         return (min_x, max_x, min_y, max_y)
 
     def get_map_bounds(self):
@@ -348,12 +273,12 @@ class MultiVehicleDemo:
                     self.ego_vehicle = v
                     break
             if not self.ego_vehicle:
-                print("[ERROR] Could not find 'mkz_2017' as EGO.")
+                log.error("Could not find 'mkz_2017' as EGO.")
                 return False
             self.ego_vehicle.set_transform(self.ego_spawning_point)
 
         if not self.ego_vehicle:
-            print("[ERROR] EGO vehicle spawn failed.")
+            log.error("EGO vehicle spawn failed.")
             return False
 
         # ------- Blueprint pools -------
@@ -450,7 +375,7 @@ class MultiVehicleDemo:
         spawned_vehicle_count = 0
         spawned_ped_count = 0
 
-        print('vehicle number (requested):', self.vehicle_num)
+        log.info("vehicle number (requested): %s", self.vehicle_num)
 
         # Added: record successfully placed Transforms (separately for vehicles/pedestrians)
         veh_tfs = []
@@ -463,7 +388,7 @@ class MultiVehicleDemo:
             try:
                 if npc_type == "pedestrian":
                     if not walker_bps:
-                        print(f"[WARN] No pedestrian blueprints, NPC[{i}] skipped.")
+                        log.warning("No pedestrian blueprints, NPC[%d] skipped.", i)
                         continue
                     bp = random.choice(walker_bps)
 
@@ -641,7 +566,7 @@ class MultiVehicleDemo:
                         spawned_vehicle_count += 1
 
             except Exception as e:
-                print(f”[ERROR] Error spawning NPC[{i}]: {e}”)
+                log.error(“Error spawning NPC[%d]: %s”, i, e)
                 # Force fallback logic that retries until success (vehicle as example)
                 if npc_type == "pedestrian" and walker_bps:
                     bp = random.choice(walker_bps)
@@ -686,8 +611,8 @@ class MultiVehicleDemo:
                                 break
                         _tick_flush()
 
-        print("spawned vehicles (vehicle.*):", spawned_vehicle_count)
-        print("spawned pedestrians:", spawned_ped_count)
+        log.info("spawned vehicles (vehicle.*): %d", spawned_vehicle_count)
+        log.info("spawned pedestrians: %d", spawned_ped_count)
 
         # Attach controllers to spawned “vehicles” (excluding pedestrians)
 
@@ -695,7 +620,7 @@ class MultiVehicleDemo:
             try:
                 self.controllers[i] = LaneKeepAndChangeController(v)
             except Exception as e:
-                print(f"[WARN] Controller creation failed veh[{i}] id={v.id}: {e}")
+                log.warning("Controller creation failed veh[%d] id=%s: %s", i, v.id, e)
 
         return True
 
@@ -738,7 +663,7 @@ class MultiVehicleDemo:
             ### Added/modified: include this sensor reference in the callback
             sensor_ego.listen(lambda event, v=self.ego_vehicle, s=sensor_ego: self.collision_callback(event, v, s))
             self.collision_sensors.append(sensor_ego)
-            print(f"[INFO] Ego Vehicle {self.ego_vehicle.id} collision sensor attached: {sensor_ego.id}")
+            log.info("Ego Vehicle %s collision sensor attached: %s", self.ego_vehicle.id, sensor_ego.id)
 
             # ----- Attach LaneInvasionSensor to ego vehicle -----
             lane_invasion_bp = blueprint_library.find('sensor.other.lane_invasion')
@@ -749,7 +674,7 @@ class MultiVehicleDemo:
                 attach_to=self.ego_vehicle
             )
             self.lane_invasion_sensor_ego.listen(self.lane_invasion_callback)
-            print(f"[INFO] Ego Vehicle {self.ego_vehicle.id} lane invasion sensor attached: {self.lane_invasion_sensor_ego.id}")
+            log.info("Ego Vehicle %s lane invasion sensor attached: %s", self.ego_vehicle.id, self.lane_invasion_sensor_ego.id)
 
         # Other autonomous vehicles collision sensors
         for veh in self.vehicles:

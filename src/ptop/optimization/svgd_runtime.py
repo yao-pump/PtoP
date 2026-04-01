@@ -26,52 +26,10 @@ from typing import Optional, Tuple
 import numpy as np
 import carla
 
-
-# ---------- small geom helpers ----------
-
-def _yaw_to_unit(yaw_deg: float) -> Tuple[float, float]:
-    r = math.radians(yaw_deg)
-    return math.cos(r), math.sin(r)
-
-
-def _ego_local_sd(ego_tf: carla.Transform, pt: carla.Location) -> Tuple[float, float]:
-    dx = pt.x - ego_tf.location.x
-    dy = pt.y - ego_tf.location.y
-    cy, sy = _yaw_to_unit(ego_tf.rotation.yaw)
-    s = dx * cy + dy * sy
-    d = -dx * sy + dy * cy
-    return s, d
-
-
-def _wrap_yaw_deg(a: float) -> float:
-    # map to (-180, 180]
-    while a <= -180.0:
-        a += 360.0
-    while a > 180.0:
-        a -= 360.0
-    return a
-
-
-def _apply_local_offset(ego_tf: carla.Transform, ds: float, dd: float, dyaw_deg: float) -> carla.Transform:
-    """Given ego_tf and local offsets (ds, dd, dyaw), build world transform."""
-    cy, sy = _yaw_to_unit(ego_tf.rotation.yaw)
-    # forward (s) = (cy, sy), right (d) = (-sy, cy)
-    fx, fy = cy, sy
-    rx, ry = -sy, cy
-    loc = carla.Location(
-        x=ego_tf.location.x + ds * fx + dd * rx,
-        y=ego_tf.location.y + ds * fy + dd * ry,
-        z=ego_tf.location.z  # keep same Z
-    )
-    yaw = _wrap_yaw_deg(ego_tf.rotation.yaw + dyaw_deg)
-    rot = carla.Rotation(pitch=ego_tf.rotation.pitch, yaw=yaw, roll=ego_tf.rotation.roll)
-    return carla.Transform(loc, rot)
-
-
-def _decompose_to_local(ego_tf: carla.Transform, npc_tf: carla.Transform) -> Tuple[float, float, float]:
-    ds, dd = _ego_local_sd(ego_tf, npc_tf.location)
-    dyaw = _wrap_yaw_deg(npc_tf.rotation.yaw - ego_tf.rotation.yaw)
-    return ds, dd, dyaw
+from ptop.utils.geometry import (
+    yaw_to_unit, ego_local_sd, wrap_yaw_deg,
+    apply_local_offset, decompose_to_local,
+)
 
 
 class RuntimeNPCSVGD:
@@ -270,7 +228,7 @@ class RuntimeNPCSVGD:
         # 3) build particle matrix X [M,3] = (ds, dd, dyaw)
         X_list = []
         for tf in sel_tfs:
-            ds, dd, dy = _decompose_to_local(ego_tf, tf)
+            ds, dd, dy = decompose_to_local(ego_tf, tf)
             ds = float(np.clip(ds, -self.ds_lim, self.ds_lim))
             dd = float(np.clip(dd, -self.dd_lim, self.dd_lim))
             dy = float(np.clip(dy, -self.dyaw_lim, self.dyaw_lim))
@@ -288,7 +246,7 @@ class RuntimeNPCSVGD:
 
             for k in range(M):
                 ds_k, dd_k, dy_k = float(X[k, 0]), float(X[k, 1]), float(X[k, 2])
-                tf_k = _apply_local_offset(ego_tf, ds_k, dd_k, dy_k)
+                tf_k = apply_local_offset(ego_tf, ds_k, dd_k, dy_k)
                 x_vec = (ds_k, dd_k, dy_k)
 
                 # ---- Compatible with multiple score_and_grad signatures; falls back to numerical finite differences on failure ----
@@ -309,7 +267,7 @@ class RuntimeNPCSVGD:
                             fd = self.grad_eps or 0.25
 
                             def sc(s, d, y):
-                                t = _apply_local_offset(ego_tf, float(s), float(d), float(y))
+                                t = apply_local_offset(ego_tf, float(s), float(d), float(y))
                                 return float(self.surrogate.score(self.map, ego_tf, t))
 
                             g_s = (sc(ds_k + fd, dd_k, dy_k) - sc(ds_k - fd, dd_k, dy_k)) / (2 * fd)
@@ -322,7 +280,7 @@ class RuntimeNPCSVGD:
                     fd = self.grad_eps or 0.25
 
                     def sc(s, d, y):
-                        t = _apply_local_offset(ego_tf, float(s), float(d), float(y))
+                        t = apply_local_offset(ego_tf, float(s), float(d), float(y))
                         return float(self.surrogate.score(self.map, ego_tf, t))
 
                     g_s = (sc(ds_k + fd, dd_k, dy_k) - sc(ds_k - fd, dd_k, dy_k)) / (2 * fd)
@@ -361,5 +319,5 @@ class RuntimeNPCSVGD:
 
         # 6) Write back refined transforms
         for k, idx in enumerate(sel_idxs):
-            tf_new = _apply_local_offset(ego_tf, float(X[k, 0]), float(X[k, 1]), float(X[k, 2]))
+            tf_new = apply_local_offset(ego_tf, float(X[k, 0]), float(X[k, 1]), float(X[k, 2]))
             self._set_transform(surrounding, idx, tf_new)

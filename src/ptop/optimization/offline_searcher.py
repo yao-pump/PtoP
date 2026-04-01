@@ -2,19 +2,11 @@
 import random
 import math
 import numpy as np
-from ptop.utils.utility import average_population_distance
+from ptop.utils.utility import average_population_distance, sanitize_position_info
 
 def _distance(loc1, loc2):
     return math.sqrt((loc1.x - loc2.x)**2 + (loc1.y - loc2.y)**2)
 
-def _sanitize_position_info(pi: dict) -> dict:
-    # Backward compatibility: surrounding_transforms -> surrounding_info
-    if 'surrounding_transforms' in pi and 'surrounding_info' not in pi:
-        pi['surrounding_info'] = [{'transform': t, 'type': 'car'} for t in pi['surrounding_transforms']]
-        pi.pop('surrounding_transforms', None)
-    if 'surrounding_info' in pi:
-        pi['vehicle_num'] = len(pi['surrounding_info'])
-    return pi
 
 def sample_position_info(carla_map):
     NPC_TYPES = ["bicycle", "car"]
@@ -59,7 +51,7 @@ class CombinedGA:
     def sample_initial_population(self):
         for _ in range(self.population_size):
             pos_info = sample_position_info(self.carla_map)
-            ind = {"position_info": _sanitize_position_info(pos_info)}
+            ind = {"position_info": sanitize_position_info(pos_info)}
             if self.enable_action_ga:
                 ind["action_info"] = sample_action_info(ind["position_info"]["vehicle_num"], self.seq_len)
             self.population.append(ind)
@@ -68,12 +60,12 @@ class CombinedGA:
         if random.random() >= crossover_rate:
             # Defensively sanitize both parents' fields
             return (
-                {"position_info": _sanitize_position_info(parent1["position_info"])},
-                {"position_info": _sanitize_position_info(parent2["position_info"])}
+                {"position_info": sanitize_position_info(parent1["position_info"])},
+                {"position_info": sanitize_position_info(parent2["position_info"])}
             )
 
-        p1 = _sanitize_position_info(parent1["position_info"])
-        p2 = _sanitize_position_info(parent2["position_info"])
+        p1 = sanitize_position_info(parent1["position_info"])
+        p2 = sanitize_position_info(parent2["position_info"])
 
         child1 = {'position_info': {}}
         child2 = {'position_info': {}}
@@ -97,7 +89,7 @@ class CombinedGA:
             scores = []
             for _ in range(10):
                 pos_info = sample_position_info(self.carla_map)
-                ind = {"position_info": _sanitize_position_info(pos_info)}
+                ind = {"position_info": sanitize_position_info(pos_info)}
                 candidates.append(ind)
             for ind in candidates:
                 dist = average_population_distance(ind, self.safe_set)
@@ -105,9 +97,9 @@ class CombinedGA:
             return candidates[int(np.argmax(scores))]
         else:
             # Still return the individual with sanitized fields
-            out = {"position_info": _sanitize_position_info(individual["position_info"])}
+            out = {"position_info": sanitize_position_info(individual["position_info"])}
             return out
 
     def resample(self):
         pos_info = sample_position_info(self.carla_map)
-        return {"position_info": _sanitize_position_info(pos_info)}
+        return {"position_info": sanitize_position_info(pos_info)}

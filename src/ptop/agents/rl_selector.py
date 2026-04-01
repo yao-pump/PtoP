@@ -19,6 +19,8 @@ import random
 import numpy as np
 from itertools import product
 
+from ptop.utils.geometry import to_local, vel_local
+
 try:
     import carla
 except Exception:
@@ -26,18 +28,6 @@ except Exception:
 
 
 # ============ Local coordinates / features ============
-
-def _to_local(ego_tf: "carla.Transform", loc: "carla.Location") -> Tuple[float, float]:
-    dx = loc.x - ego_tf.location.x
-    dy = loc.y - ego_tf.location.y
-    yaw = math.radians(ego_tf.rotation.yaw)
-    c, s = math.cos(-yaw), math.sin(-yaw)
-    return c * dx - s * dy, s * dx + c * dy
-
-def _vel_local(ego_tf: "carla.Transform", vel: "carla.Vector3D") -> Tuple[float, float]:
-    yaw = math.radians(ego_tf.rotation.yaw)
-    c, s = math.cos(-yaw), math.sin(-yaw)
-    return c * vel.x - s * vel.y, s * vel.x + c * vel.y
 
 def _ttc(lx: float, ly: float, rvx: float, lat_range: float = 6.0, eps: float = 1e-3) -> float:
     “””
@@ -58,9 +48,9 @@ def compute_phi(ego: "carla.Vehicle", other: "carla.Vehicle") -> np.ndarray:
       lx ∈ [-40, 40]m, ly ∈ [-10, 10]m, rvx/rvy ∈ [-10, 10]m/s, ttc mapped to [0,1] (5s bandwidth)
     """
     etf = ego.get_transform()
-    lx, ly = _to_local(etf, other.get_location())
-    evx, evy = _vel_local(etf, ego.get_velocity())
-    ovx, ovy = _vel_local(etf, other.get_velocity())
+    lx, ly = to_local(etf, other.get_location())
+    evx, evy = vel_local(etf, ego.get_velocity())
+    ovx, ovy = vel_local(etf, other.get_velocity())
     rvx, rvy = ovx - evx, ovy - evy
     ttc = _ttc(lx, ly, rvx, lat_range=6.0)
 
@@ -346,18 +336,6 @@ def analyze_scene(world_map: "carla.Map", ego: "carla.Vehicle",
     approaching_cnt = 0
     min_ttc = 1e6
 
-    def _to_local(etf, loc):
-        dx = loc.x - etf.location.x
-        dy = loc.y - etf.location.y
-        yaw = math.radians(etf.rotation.yaw)
-        c, s = math.cos(-yaw), math.sin(-yaw)
-        return c * dx - s * dy, s * dx + c * dy
-
-    def _vel_local(etf, vel):
-        yaw = math.radians(etf.rotation.yaw)
-        c, s = math.cos(-yaw), math.sin(-yaw)
-        return c * vel.x - s * vel.y, s * vel.x + c * vel.y
-
     def _ttc(lx, ly, rvx, lat_range=6.0, eps=1e-3):
         # Only use longitudinal TTC when directly ahead with small lateral offset
         if not (lx > 0 and abs(ly) < lat_range):
@@ -367,16 +345,16 @@ def analyze_scene(world_map: "carla.Map", ego: "carla.Vehicle",
             return 1e6
         return lx / rel_speed_long
 
-    evx, evy = _vel_local(ego_tf, ego.get_velocity())
+    evx, evy = vel_local(ego_tf, ego.get_velocity())
     for v in vehicles:
         if v.id == ego.id:
             continue
         total_cnt += 1
-        lx, ly = _to_local(ego_tf, v.get_location())
+        lx, ly = to_local(ego_tf, v.get_location())
         if lx < -5 or lx > long_probe or abs(ly) > lat_probe:
             continue
         forward_cnt += 1
-        vvx, vvy = _vel_local(ego_tf, v.get_velocity())
+        vvx, vvy = vel_local(ego_tf, v.get_velocity())
         rvx = vvx - evx
         ttc = _ttc(lx, ly, rvx, lat_range=lat_probe)
         min_ttc = min(min_ttc, ttc)
@@ -481,20 +459,20 @@ def filter_triggerables(ego: "carla.Vehicle", vehicles: List["carla.Vehicle"],
     hz_tau = policy["hazard_tau"]
     ttc_th = policy["trigger_ttc"]
 
-    evx, evy = _vel_local(ego_tf, ego.get_velocity())
+    evx, evy = vel_local(ego_tf, ego.get_velocity())
 
     scored: List[Tuple[float, "carla.Vehicle"]] = []
     for v in vehicles:
         if v.id == ego.id:
             continue
-        lx, ly = _to_local(ego_tf, v.get_location())
+        lx, ly = to_local(ego_tf, v.get_location())
         if lx < -5.0 or lx > L or abs(ly) > W:
             continue
 
         phi = compute_phi(ego, v)
         hz = art.risk(phi)
 
-        vvx, vvy = _vel_local(ego_tf, v.get_velocity())
+        vvx, vvy = vel_local(ego_tf, v.get_velocity())
         rvx = vvx - evx
         ttc = _ttc(lx, ly, rvx, lat_range=W)
 

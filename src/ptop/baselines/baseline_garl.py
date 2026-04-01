@@ -8,6 +8,7 @@ Main program (complete runnable skeleton):
 - Online fine-tuning 1-2 epochs per episode; optional EMA (if surrogate provides ema_update)
 """
 
+import logging
 import os
 import cv2
 import math
@@ -22,9 +23,12 @@ from datetime import datetime
 import torch
 import carla
 
+logger = logging.getLogger(__name__)
+
 from ptop.utils.utility import (
     has_passed_destination, action_trans, apollo_clear_prediction_planning, purge_npcs, calculate_population_distance, parents_selection, next_gen_selection
 )
+from ptop.utils.geometry import yaw_to_unit, ego_local_sd
 from ptop.core.world import MultiVehicleDemo
 from ptop.optimization.offline_searcher import CombinedGA
 from ptop.optimization.surrogate_mlp import NPCHazardMLPSurrogate
@@ -84,18 +88,6 @@ def average_population_distance(population, generation):
     """
     distances = [calculate_population_distance(population["position_info"], pop["position_info"]) for pop in generation]
     return np.mean(distances)
-def _yaw_to_unit(yaw_deg: float):
-    r = math.radians(yaw_deg)
-    return math.cos(r), math.sin(r)
-
-def ego_local_sd(ego_tf: carla.Transform, pt: carla.Location):
-    dx = pt.x - ego_tf.location.x
-    dy = pt.y - ego_tf.location.y
-    cy, sy = _yaw_to_unit(ego_tf.rotation.yaw)
-    s =  dx * cy + dy * sy
-    d = -dx * sy + dy * cy
-    return s, d
-
 # ====================== Episode Recorder ======================
 class EpisodeRecorder:
     def __init__(self, world_map):
@@ -467,9 +459,9 @@ def main():
     )
     try:
         dqn.load("dqn.pt")
-        print("[DQN] loaded checkpoint: dqn.pt")
+        logger.info("DQN loaded checkpoint: dqn.pt")
     except Exception as e:
-        print("[DQN] no checkpoint found:", e)
+        logger.info("DQN no checkpoint found: %s", e)
     rl_ctrl = RLNPCController(dqn, world_map, surrogate, device=device,
                               top_k=3, hazard_thresh=0.15)
 
@@ -502,19 +494,19 @@ def main():
 
         success = demo.setup_vehicles_with_collision(scenario_conf)
         if not success:
-            print("[ERROR] Vehicle spawn failed, skipping (not counted as a valid episode).")
+            logger.error("Vehicle spawn failed, skipping (not counted as a valid episode).")
             scenario_confs[idx_in_pop] = GA.resample()
             continue
 
         actual_n = len(demo.vehicles)
         demo.vehicle_num = actual_n
         if actual_n < MIN_NPC:
-            print(f"[WARN] only {actual_n} NPC spawned (<{MIN_NPC}), rolling back and resampling.")
+            logger.warning("only %d NPC spawned (<%d), rolling back and resampling.", actual_n, MIN_NPC)
             demo.destroy_all()
             scenario_confs[idx_in_pop] = GA.resample()
             continue
 
-        print(f"[INFO] Requested {scenario_conf.get('vehicle_num','?')}, actually spawned {actual_n} (valid episode #{number_game})")
+        logger.info("Requested %s, actually spawned %d (valid episode #%d)", scenario_conf.get('vehicle_num','?'), actual_n, number_game)
 
         controllers = []
         controller_by_actor_id = {}
@@ -585,7 +577,7 @@ def main():
             world.wait_for_tick()
 
             if time.monotonic() - wall_start > EPISODE_MAX_SECONDS:
-                print(f"[EARLY-EXIT] episode wall-clock > {EPISODE_MAX_SECONDS}s, stop.")
+                logger.warning("EARLY-EXIT: episode wall-clock > %ss, stop.", EPISODE_MAX_SECONDS)
                 break
 
             # Startup phase
@@ -593,7 +585,7 @@ def main():
                 ego_vel = demo.ego_vehicle.get_velocity()
                 speed_ego = math.sqrt(ego_vel.x ** 2 + ego_vel.y ** 2 + ego_vel.z ** 2)
                 if speed_ego > 5:
-                    print('[WARN] EGO speed abnormally high during startup phase, ending this episode.')
+                    logger.warning("EGO speed abnormally high during startup phase, ending this episode.")
                     abnormal_case = True
             if step == STARTUP_STEPS and demo.external_ads:
                 start_loc = demo.ego_vehicle.get_location()
@@ -652,19 +644,19 @@ def main():
                         progress_anchor_loc = ego_loc
                         progress_anchor_t = time.monotonic()
                     elif time.monotonic() - progress_anchor_t > NO_PROGRESS_SECONDS:
-                        print(f"[EARLY-EXIT] no progress for {NO_PROGRESS_SECONDS}s (Δ={moved:.2f}m).")
+                        logger.warning("EARLY-EXIT: no progress for %ds (delta=%.2fm).", NO_PROGRESS_SECONDS, moved)
                         timeout_cnt = 1
                         break
 
                 if demo.ego_destination is not None:
                     near_dest, pass_dest = has_passed_destination(demo.ego_vehicle, demo.ego_destination, world_map)
                     if step != 0 and demo.external_ads and near_dest:
-                        print('Arrive, episode end')
+                        logger.info("Arrive, episode end")
                         break
                     else:
                         if pass_dest:
                             for mod in demo.modules: demo.enable_module(mod)
-                            print('pass destination error'); abnormal_case = True
+                            logger.error("pass destination error"); abnormal_case = True
 
                 # Camera follow
                 spectator = world.get_spectator()
@@ -687,7 +679,7 @@ def main():
                 # === DQN: first generate (s',r,done) from previous step's (s,a) and train; then select new takeover actions ===
                 rl_ctrl.post_tick_update(demo.ego_vehicle, demo.vehicles, collided=collided_now)
                 if collided_now:
-                    print("[EARLY-EXIT] collision detected. Ending episode immediately.")
+                    logger.warning("EARLY-EXIT: collision detected. Ending episode immediately.")
                     break
 
                 if (step % 3) == 0:  # Frequency kept consistent with original ART
@@ -707,7 +699,7 @@ def main():
         try:
             apollo_clear_prediction_planning(times=3, interval=0.05)
         except Exception as e:
-            print(f"[WARN] apollo_clear_prediction_planning failed: {e}")
+            logger.warning("apollo_clear_prediction_planning failed: %s", e)
 
         for _ in range(300):
             world.wait_for_tick()
@@ -724,9 +716,9 @@ def main():
             distance_to_start = math.dist([start_loc.x, start_loc.y], [end_loc.x, end_loc.y])
         else:
             distance_to_start = 0.0
-        print('Moved distance: ', distance_to_start)
+        logger.info("Moved distance: %s", distance_to_start)
         if distance_to_start < 1:
-            print("[WARNING] EGO start-to-end distance < 1m, deemed abnormal, excluded from this generation.")
+            logger.warning("EGO start-to-end distance < 1m, deemed abnormal, excluded from this generation.")
             abnormal_case = True
 
         # Statistics + GA evolution (only for valid episodes)
@@ -750,7 +742,7 @@ def main():
                 "scenario_conf": jsonable_conf
             }
             append_jsonl(COLLIDED_JSONL, collided_record)
-            print(f"[SAVED] scenario appended to {COLLIDED_JSONL}")
+            logger.info("SAVED: scenario appended to %s", COLLIDED_JSONL)
             if demo.side_collision_count_vehicle == 0 and RECORDING and os.path.isdir(save_dir):
                 shutil.rmtree(save_dir)
 
@@ -772,7 +764,7 @@ def main():
                 for rec_i in gen_records:
                     fitness["safety_violation"].append(-1 if rec_i["collided"] else 1)
                     fitness["ART_trigger_time"].append(ART_triggered)
-                print(fitness)
+                logger.debug("fitness: %s", fitness)
                 parents = parents_selection(fitness, scenario_confs, population_size)
                 for i in range(0, population_size, 2):
                     parent_1, parent_2 = parents[i], parents[i + 1]
@@ -797,7 +789,7 @@ def main():
                 scenario_confs = next_gen_selection(fitness, scenario_confs, population_size)
 
                 gen_records.clear()
-                print(f"Generation {current_generation} end")
+                logger.info("Generation %d end", current_generation)
                 current_generation += 1
 
             # —— Save DQN at end of each episode (optional) ——
@@ -815,22 +807,22 @@ def main():
             else:
                 scenario_confs[idx_in_pop + population_size] = GA.resample()
 
-            print(f"[INFO] This episode was abnormal, rolled back and resampled (not counted as a valid episode).")
+            logger.info("This episode was abnormal, rolled back and resampled (not counted as a valid episode).")
 
         demo.destroy_all()
 
         keep_ids = {demo.ego_vehicle.id} if demo.ego_vehicle else set()
         rem_veh, rem_walk = purge_npcs(world, client, tm=tm, keep_actor_ids=keep_ids,
                                        include_walkers=True, hard_teleport=True)
-        print(f"[PURGE] left vehicles={rem_veh}, walkers={rem_walk}")
+        logger.info("PURGE: left vehicles=%d, walkers=%d", rem_veh, rem_walk)
 
     # ---- Final Statistics ----
-    print('Side collision (ego×vehicle):', side_total)
-    print('Ego vehicle object collision:', obj_collison_total)
-    print('Time Out:', timeout_total)
-    print('red light:', red_light_total)
+    logger.info("Side collision (ego x vehicle): %s", side_total)
+    logger.info("Ego vehicle object collision: %s", obj_collison_total)
+    logger.info("Time Out: %s", timeout_total)
+    logger.info("red light: %s", red_light_total)
     demo.destroy_all(); demo.close_connection()
-    print("Cleanup done.")
+    logger.info("Cleanup done.")
 
 
 if __name__ == "__main__":

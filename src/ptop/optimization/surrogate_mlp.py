@@ -20,30 +20,7 @@ try:
 except Exception:  # pragma: no cover
     carla = None
 
-
-# ============== Geometry helpers, consistent with the main program ==============
-
-def _yaw_to_unit(yaw_deg: float):
-    r = math.radians(yaw_deg)
-    return math.cos(r), math.sin(r)
-
-
-def _relative_yaw_deg(ego_tf, npc_tf) -> float:
-    dy = npc_tf.rotation.yaw - ego_tf.rotation.yaw
-    while dy >= 180:
-        dy -= 360
-    while dy < -180:
-        dy += 360
-    return dy
-
-
-def _ego_local_sd(ego_tf, loc):
-    dx = loc.x - ego_tf.location.x
-    dy = loc.y - ego_tf.location.y
-    cy, sy = _yaw_to_unit(ego_tf.rotation.yaw)
-    s = dx * cy + dy * sy
-    d = -dx * sy + dy * cy
-    return s, d
+from ptop.utils.geometry import yaw_to_unit, ego_local_sd, relative_yaw_deg
 
 
 def _lane_center_offset(world_map, npc_tf) -> float:
@@ -193,8 +170,8 @@ class NPCHazardMLPSurrogate:
         dy = torch.tensor(float(x_vec[2]), dtype=torch.float32, device=self.device, requires_grad=True)  # degree
 
         # Baseline (current state)
-        s0, d0 = _ego_local_sd(ego_tf, npc_tf.location)
-        base_rel_deg = _relative_yaw_deg(ego_tf, npc_tf)
+        s0, d0 = ego_local_sd(ego_tf, npc_tf.location)
+        base_rel_deg = relative_yaw_deg(ego_tf, npc_tf)
 
         # Apply (s,d,delta_yaw) increments to features (same scaling as _build_feats)
         s = (torch.tensor(s0, device=self.device) + ds) / 12.0
@@ -268,8 +245,8 @@ class NPCHazardMLPSurrogate:
 
     # --------- Internal: build features consistent with forward pass ---------
     def _build_feats(self, world_map, ego_tf, npc_tf):
-        s0, d0 = _ego_local_sd(ego_tf, npc_tf.location)
-        rel_deg = _relative_yaw_deg(ego_tf, npc_tf)
+        s0, d0 = ego_local_sd(ego_tf, npc_tf.location)
+        rel_deg = relative_yaw_deg(ego_tf, npc_tf)
         rel_rad = math.radians(rel_deg)
         lane_lat = _lane_center_offset(world_map, npc_tf)
         lane_lat = float(max(-self.opts.clamp_lane_lat, min(self.opts.clamp_lane_lat, lane_lat)))

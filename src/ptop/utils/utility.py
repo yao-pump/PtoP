@@ -1,17 +1,27 @@
-import numpy as np
-import xml.etree.ElementTree as ET
+import json
+import logging
 import math
-import carla
-from typing import List, Set
-from typing import List, Callable, Any, Sequence
 import time
-import requests, time, carla
-import json, urllib.request
+import urllib.request
+import xml.etree.ElementTree as ET
+from typing import Any, Callable, Iterable, List, Optional, Sequence, Set, Tuple
+
+import carla
+import numpy as np
+import requests
+
+logger = logging.getLogger(__name__)
 
 
-import time
-import carla
-from typing import Tuple, Optional, Iterable, Set
+def sanitize_position_info(pi: dict) -> dict:
+    """Backward compatibility: convert surrounding_transforms to surrounding_info."""
+    if 'surrounding_transforms' in pi and 'surrounding_info' not in pi:
+        pi['surrounding_info'] = [{'transform': t, 'type': 'car'} for t in pi['surrounding_transforms']]
+        pi.pop('surrounding_transforms', None)
+    if 'surrounding_info' in pi:
+        pi['vehicle_num'] = len(pi['surrounding_info'])
+    return pi
+
 
 def purge_npcs(world: carla.World,
                client: carla.Client,
@@ -225,17 +235,6 @@ def _to_jsonable(x):
         except Exception: pass
     return x
 
-def _yaw_to_unit(yaw_deg: float):
-    r = math.radians(yaw_deg)
-    return math.cos(r), math.sin(r)
-
-def ego_local_sd(ego_tf: carla.Transform, pt: carla.Location):
-    dx = pt.x - ego_tf.location.x
-    dy = pt.y - ego_tf.location.y
-    cy, sy = _yaw_to_unit(ego_tf.rotation.yaw)
-    s =  dx * cy + dy * sy
-    d = -dx * sy + dy * cy
-    return s, d
 def get_xy_speed(vehicle):
     """
     Get the X and Y speed components of a vehicle in m/s.
@@ -453,7 +452,7 @@ def max_population_distance(population, generation):
     Compute the maximum distance between a population and an entire generation.
     """
     distances = [calculate_population_distance(population["position_info"], pop["position_info"]) for pop in generation]
-    return min(distances)
+    return max(distances)
 
 def parents_selection(fitness, population, population_size):
     processed_fitness = []

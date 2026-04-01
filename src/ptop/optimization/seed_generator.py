@@ -1,7 +1,7 @@
 
 
 import random
-from ptop.utils.utility import calculate_population_distance, min_population_distance, max_population_distance
+from ptop.utils.utility import calculate_population_distance, min_population_distance, max_population_distance, sanitize_position_info
 
 def sample_position_info(carla_map):
     NPC_TYPES = ["pedestrian"]
@@ -22,14 +22,6 @@ def sample_position_info(carla_map):
         "surrounding_info": surrounding_info
     }
 
-def _sanitize_position_info(pi: dict) -> dict:
-    # Backward compatibility: surrounding_transforms -> surrounding_info
-    if 'surrounding_transforms' in pi and 'surrounding_info' not in pi:
-        pi['surrounding_info'] = [{'transform': t, 'type': 'car'} for t in pi['surrounding_transforms']]
-        pi.pop('surrounding_transforms', None)
-    if 'surrounding_info' in pi:
-        pi['vehicle_num'] = len(pi['surrounding_info'])
-    return pi
 
 
 class seed_generator:
@@ -44,7 +36,7 @@ class seed_generator:
     def sample_seed(self):
         for _ in range(self.candidate_size):
             pos_info = sample_position_info(self.carla_map)
-            ind = {"position_info": _sanitize_position_info(pos_info)}
+            ind = {"position_info": sanitize_position_info(pos_info)}
             self.candidate_seed_set.append(ind)
         if len(self.executed_seed_set) == 0:
             return random.choice(self.candidate_seed_set)
@@ -57,5 +49,5 @@ class seed_generator:
 
     def sample_seed_random(self):
         pos_info = sample_position_info(self.carla_map)
-        return {"position_info": _sanitize_position_info(pos_info)}
+        return {"position_info": sanitize_position_info(pos_info)}
 
