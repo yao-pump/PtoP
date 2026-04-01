@@ -24,15 +24,15 @@ import torch
 import torch.nn as nn
 import carla
 
-from utility import (
+from ptop.utils.utility import (
     has_passed_destination, action_trans, apollo_clear_prediction_planning, purge_npcs, ego_local_sd, _to_jsonable, append_jsonl
 )
 
-from npc_surrogate_mlp import NPCHazardMLPSurrogate
-from world import MultiVehicleDemo
-from ART_SEED_GENERATOR import seed_generator
+from ptop.optimization.surrogate_mlp import NPCHazardMLPSurrogate
+from ptop.core.world import MultiVehicleDemo
+from ptop.optimization.seed_generator import seed_generator
 
-from npc_svgd_runtime import RuntimeNPCSVGD
+from ptop.optimization.svgd_runtime import RuntimeNPCSVGD
 
 
 K_ATTACK = 3      # 对抗 NPC 数（车与人各自最多 K 个）

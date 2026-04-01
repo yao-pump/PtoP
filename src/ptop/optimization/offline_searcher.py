@@ -2,7 +2,7 @@
 import random
 import math
 import numpy as np
-from utility import average_population_distance
+from ptop.utils.utility import average_population_distance
 
 def _distance(loc1, loc2):
     return math.sqrt((loc1.x - loc2.x)**2 + (loc1.y - loc2.y)**2)

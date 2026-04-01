@@ -22,14 +22,14 @@ from datetime import datetime
 import torch
 import carla
 
-from utility import (
+from ptop.utils.utility import (
     has_passed_destination, action_trans, apollo_clear_prediction_planning, purge_npcs, calculate_population_distance, parents_selection, next_gen_selection
 )
-from world import MultiVehicleDemo
-from offline_searcher import CombinedGA
-from npc_surrogate_mlp import NPCHazardMLPSurrogate
-from npc_svgd_runtime import RuntimeNPCSVGD
-from replay_buffer import NearMissReplay
+from ptop.core.world import MultiVehicleDemo
+from ptop.optimization.offline_searcher import CombinedGA
+from ptop.optimization.surrogate_mlp import NPCHazardMLPSurrogate
+from ptop.optimization.svgd_runtime import RuntimeNPCSVGD
+from ptop.agents.replay_buffer import NearMissReplay
 
 # ====================== 全局超参数 ======================
 TIME_STEP = 0.05

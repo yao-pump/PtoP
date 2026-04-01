@@ -1,6 +1,6 @@
 import requests
 import carla
-from carla_controller import LaneKeepAndChangeController
+from ptop.core.carla_controller import LaneKeepAndChangeController
 import random
 from websocket import create_connection, WebSocketException
 import json

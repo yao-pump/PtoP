@@ -1,7 +1,7 @@
 
 
 import random
-from utility import calculate_population_distance, min_population_distance, max_population_distance
+from ptop.utils.utility import calculate_population_distance, min_population_distance, max_population_distance
 
 def sample_position_info(carla_map):
     NPC_TYPES = ["pedestrian"]

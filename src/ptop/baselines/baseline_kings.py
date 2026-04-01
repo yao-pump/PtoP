@@ -29,13 +29,13 @@ import carla
 
 # ---- 可选依赖：若没有对应函数则提供空实现 ----
 try:
-    from utility import has_passed_destination, apollo_clear_prediction_planning, purge_npcs
+    from ptop.utils.utility import has_passed_destination, apollo_clear_prediction_planning, purge_npcs
 except Exception:
     def has_passed_destination(*args, **kwargs): return (False, False)
     def apollo_clear_prediction_planning(*args, **kwargs): pass
     def purge_npcs(world, client, tm=None, keep_actor_ids=None, include_walkers=True, hard_teleport=True): return 0, 0
 
-from world import MultiVehicleDemo
+from ptop.core.world import MultiVehicleDemo
 
 # ====================== 全局超参数 ======================
 TIME_STEP = 0.05

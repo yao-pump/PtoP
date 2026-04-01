@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ptop"
+version = "0.1.0"
+description = "Particles to Perils: hazardous scenario generation for autonomous driving testing"
+requires-python = ">=3.8"
+dependencies = [
+    "numpy",
+    "torch",
+    "scipy",
+    "opencv-python",
+    "requests",
+    "websocket-client",
+]
+# Note: carla is not on PyPI -- install from CARLA's provided .egg/.whl
+
+[project.scripts]
+ptop = "ptop.core.ptop:main"
+ptop-diversity = "ptop.analysis.compute_diversity:main"
+
+[project.optional-dependencies]
+listener = ["flask"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ptop"]
