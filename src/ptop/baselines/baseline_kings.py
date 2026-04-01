@@ -450,7 +450,7 @@ def main():
             distance_to_start = 0.0
         logger.info("Moved distance: %s", distance_to_start)
         if distance_to_start < 1:
-            print("[WARNING] EGO start-to-end distance < 1m, deemed abnormal, excluded from statistics.")
+            logger.warning("EGO start-to-end distance < 1m, deemed abnormal, excluded from statistics.")
             abnormal_case = True
 
         # Statistics & logging
@@ -474,7 +474,7 @@ def main():
                 "scenario_conf": jsonable_conf
             }
             append_jsonl(COLLIDED_JSONL, record)
-            print(f"[SAVED] scenario appended to {COLLIDED_JSONL}")
+            logger.info("SAVED: scenario appended to %s", COLLIDED_JSONL)
 
             # If no collision and recording directory exists, delete it
             if demo.side_collision_count_vehicle == 0 and RECORDING and os.path.isdir(save_dir):
@@ -491,25 +491,25 @@ def main():
                     import shutil; shutil.rmtree(save_dir)
                 except Exception:
                     pass
-            print(f"[INFO] This episode was abnormal, statistics skipped.")
+            logger.info("This episode was abnormal, statistics skipped.")
 
         # Cleanup
         demo.destroy_all()
         keep_ids = {demo.ego_vehicle.id} if demo.ego_vehicle else set()
         rem_veh, rem_walk = purge_npcs(world, client, tm=tm, keep_actor_ids=keep_ids,
                                        include_walkers=True, hard_teleport=True)
-        print(f"[PURGE] left vehicles={rem_veh}, walkers={rem_walk}")
+        logger.info("PURGE: left vehicles=%d, walkers=%d", rem_veh, rem_walk)
 
     # ---- Summary ----
-    print('=== KING baseline summary ===')
-    print('Side collision (ego×vehicle):', side_total)
-    print('Ego object collision:', obj_collision_total)
-    print('Timeouts:', timeout_total)
-    print('Red lights:', red_light_total)
-    print('Cross solid lines:', cross_solid_total)
+    logger.info("=== KING baseline summary ===")
+    logger.info("Side collision (ego x vehicle): %s", side_total)
+    logger.info("Ego object collision: %s", obj_collision_total)
+    logger.info("Timeouts: %s", timeout_total)
+    logger.info("Red lights: %s", red_light_total)
+    logger.info("Cross solid lines: %s", cross_solid_total)
 
     demo.destroy_all(); demo.close_connection()
-    print("Cleanup done.")
+    logger.info("Cleanup done.")
 
 if __name__ == "__main__":
     main()

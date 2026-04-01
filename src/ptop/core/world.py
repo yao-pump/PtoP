@@ -683,7 +683,7 @@ class MultiVehicleDemo:
             ### Added/modified: include this sensor reference in the callback
             sensor.listen(lambda event, v=veh, s=sensor: self.collision_callback(event, v, s))
             self.collision_sensors.append(sensor)
-            print(f"[INFO] Vehicle {veh.id} collision sensor attached: {sensor.id}")
+            log.info("Vehicle %s collision sensor attached: %s", veh.id, sensor.id)
 
     def lane_invasion_callback(self, event):
         """
@@ -698,7 +698,7 @@ class MultiVehicleDemo:
             ]:
                 # Once a solid line type is detected => indicates crossing a solid line
                 self.ego_cross_solid_line = True
-                print("[INFO] EGO vehicle crossed a solid line!")
+                log.info("EGO vehicle crossed a solid line!")
                 break
 
     # ==================== Blame Attribution (this section is newly added/replaced) ====================
@@ -709,41 +709,11 @@ class MultiVehicleDemo:
     IMPULSE_MIN              = 400.0  # Collision impulse lower bound
     REAR_END_BONUS           = 0.05   # Relaxed ratio threshold for rear-end scenarios
 
-    # ---- Helper: implemented as static methods for easy in-class invocation ----
-    @staticmethod
-    def _vec_norm(v: "carla.Vector3D") -> float:
-        return math.sqrt(v.x*v.x + v.y*v.y + v.z*v.z)
-
-    @staticmethod
-    def _spd_and_vec(actor):
-        v = actor.get_velocity()
-        return MultiVehicleDemo._vec_norm(v), v
-
-    @staticmethod
-    def _unit_vec(a: "carla.Location", b: "carla.Location") -> "carla.Vector3D":
-        dx, dy, dz = (b.x - a.x), (b.y - a.y), (b.z - a.z)
-        n = math.sqrt(dx*dx + dy*dy + dz*dz) + 1e-9
-        return carla.Vector3D(dx/n, dy/n, dz/n)
-
-    @staticmethod
-    def _dot(a: "carla.Vector3D", b: "carla.Vector3D") -> float:
-        return a.x*b.x + a.y*b.y + a.z*b.z
-
-    @staticmethod
-    def _ego_local_sd(ego_tf: "carla.Transform", loc: "carla.Location"):
-        yaw = math.radians(ego_tf.rotation.yaw)
-        cy, sy = math.cos(yaw), math.sin(yaw)
-        dx = loc.x - ego_tf.location.x
-        dy = loc.y - ego_tf.location.y
-        s =  dx * cy + dy * sy
-        d = -dx * sy + dy * cy
-        return s, d
-
     def _assign_blame_ego(self,
-                          ego: "carla.Vehicle",
-                          other: "carla.Actor",
-                          world_map: "carla.Map",
-                          event_normal_impulse: "carla.Vector3D"):
+                          ego: “carla.Vehicle”,
+                          other: “carla.Actor”,
+                          world_map: “carla.Map”,
+                          event_normal_impulse: “carla.Vector3D”):
         “””
         Returns: (ego_fault: bool, why: str)
         Based on: comparing the ratio of “approach speed components” along the EGO->other direction + impulse and minimum speed thresholds.
@@ -752,36 +722,36 @@ class MultiVehicleDemo:
             # Connecting unit vector (from EGO toward other)
             loc_e = ego.get_transform().location
             loc_o = other.get_transform().location
-            n = self._unit_vec(loc_e, loc_o)
+            n = unit_vec(loc_e, loc_o)
 
             # Speed components
-            _, v_e = self._spd_and_vec(ego)
-            if hasattr(other, "get_velocity"):
-                _, v_o = self._spd_and_vec(other)
+            _, v_e = spd_and_vec(ego)
+            if hasattr(other, “get_velocity”):
+                _, v_o = spd_and_vec(other)
             else:
                 v_o = carla.Vector3D(0.0, 0.0, 0.0)
 
-            c_ego   = max(0.0, self._dot(v_e, n))     # EGO toward other
-            c_other = max(0.0, -self._dot(v_o, n))    # Other toward EGO (equivalent to -v_o dot n)
+            c_ego   = max(0.0, dot(v_e, n))     # EGO toward other
+            c_other = max(0.0, -dot(v_o, n))    # Other toward EGO (equivalent to -v_o dot n)
 
             # Impulse magnitude
-            J = self._vec_norm(event_normal_impulse)
+            J = vec_norm(event_normal_impulse)
 
             # Pose relationship (rear-end determination: other is directly ahead and EGO approach is greater)
-            s_rel, _ = self._ego_local_sd(ego.get_transform(), loc_o)
+            s_rel, _ = ego_local_sd(ego.get_transform(), loc_o)
             rear_end_like = (s_rel > 0.0 and c_ego > c_other)
 
             r = c_ego / (c_ego + c_other + 1e-9)
             thr = self.EGO_FAULT_RATIO - (self.REAR_END_BONUS if rear_end_like else 0.0)
 
             if J >= self.IMPULSE_MIN and c_ego >= self.EGO_FAULT_CLOSE_SPEED_MIN and r >= thr:
-                reason = f"ego_fault: J={J:.1f}, c_ego={c_ego:.2f}, c_other={c_other:.2f}, r={r:.2f}, rear_end={rear_end_like}"
+                reason = f”ego_fault: J={J:.1f}, c_ego={c_ego:.2f}, c_other={c_other:.2f}, r={r:.2f}, rear_end={rear_end_like}”
                 return True, reason
             else:
-                reason = f"non_ego_fault: J={J:.1f}, c_ego={c_ego:.2f}, c_other={c_other:.2f}, r={r:.2f}, rear_end={rear_end_like}"
+                reason = f”non_ego_fault: J={J:.1f}, c_ego={c_ego:.2f}, c_other={c_other:.2f}, r={r:.2f}, rear_end={rear_end_like}”
                 return False, reason
         except Exception as e:
-            return False, f"non_ego_fault: exception {e}"
+            return False, f”non_ego_fault: exception {e}”
 
     def collision_callback(self, event, vehicle, sensor):
         """
